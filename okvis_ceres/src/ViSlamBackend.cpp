@@ -873,7 +873,10 @@ void ViSlamBackend::optimiseRealtimeGraph(
 
 
 
-  // run the optimiser
+  // run the optimiser. Keep Ceres' default Eigen (CPU) dense backend: measured on
+  // Thor, routing this solve through cuSOLVER is ~2.4x slower at our window sizes
+  // (the reduced system is far too small to amortise launch overhead) and it
+  // competes with the depth network for the GPU.
   realtimeGraph_.options_.linear_solver_type = ::ceres::DENSE_SCHUR;
   realtimeGraph_.optimise(numIter, numThreads, verbose);
 

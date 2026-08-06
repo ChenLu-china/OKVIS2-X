@@ -1,0 +1,173 @@
+%YAML:1.2
+# === 640x496 VARIANT (VIO front-end at half res for higher localisation fps).
+# Auto-generated from okvis2_mapping.yaml: focal/pp/P/size halved, detection
+# radius halved. Depth (S2M2 640x512 engine) is near-native here.
+%YAML:1.2
+# =====================================================================
+# DENSE-MAPPING variant of the S56 rectified config. Identical to okvis2.yaml
+# (same validated intrinsics / T_SC / IMU / frontend / estimator), but enables
+# the stereo depth network + supereight2 submapping:
+#   * cam0 camera_type: gray+depth   (network depth attaches to cam0)
+#   * camera_parameters.deep_stereo_indices: [0, 1]  (the stereo pair)
+#   * output_parameters.enable_submapping: true
+# The pre-rectified pinhole stereo pair (fov_scale=0.97) is geometrically
+# equivalent to the rsD455 rectified stereo the depth network is proven on.
+# Pair with components/OKVIS2-X/config/s56/se2.yaml (supereight map config).
+# =====================================================================
+# OKVIS2-X config for the S56 rig -- RECTIFIED (pinhole) variant, Option B.
+#
+# Images fed to OKVIS are ALREADY stereo-rectified with
+# cv2.fisheye.stereoRectify(K/D from Kalibr 3_camimu, fov_scale=0.97,
+# balance=0.0), full resolution 2560x1984.
+#
+# ALL camera parameters below come from ONE self-consistent joint cam-IMU
+# calibration performed directly on those rectified pinhole images:
+#   config/s56_result_20260730/.../4_rect_pinhole/camimu_verify/
+#     camchain-imucam.yaml  (K, D radtan, T_cam_imu, timeshift)
+#     imu.yaml              (IMU noise)
+# So K/D and T_SC share the same source (no expected_P vs Kalibr-K mixing).
+# Independent |g| check: 9.806554 m/s^2 (-0.0010% vs g0), scale verified.
+#
+# Conventions:
+#   * T_SC maps Camera->Sensor(IMU): p_S = T_SC * p_C = inv(T_cam_imu).
+#   * distortion_type: radialtangential == Kalibr radtan [k1,k2,p1,p2].
+#   * image_delay = -timeshift_cam_imu (Kalibr timeshift ~ -0.03214 s).
+#   * Images are pre-rectified => mapping_rectification: false (OKVIS must NOT
+#     rectify again); fov_scale / deep_stereo_indices intentionally omitted.
+# =====================================================================
+cameras:
+  - {T_SC:
+       [0.000644050576,  0.999999453468, -0.000823566744, -0.002795484758,
+       -0.999991837094,  0.000640760146, -0.003989382260,  0.023980666572,
+       -0.003988852371,  0.000826129385,  0.999991703249,  0.015992562332,
+        0.0,             0.0,             0.0,             1.0],
+     image_dimension: [640, 496], # rectified at half res (see s56_rectified.yaml)
+     # OPTION A (4_rect_pinhole/README.md) - declare the rectified images with
+     # the SAME projection matrix P we actually rectify with (stereoRectify
+     # fov_scale=0.97), D=0. Required for the depth network, which computes
+     # depth = focal*baseline/disparity WITHOUT applying distortion, so it needs
+     # the true rectification focal (828.99/2=414.493), not Kalibr's re-fit
+     # 405.88 (that trades 2% focal into a residual radtan the depth path never
+     # applies -> ~2% depth-scale bias -> submap misalignment). P is shared, so
+     # both cams use identical intrinsics.
+     distortion_coefficients: [0.0, 0.0, 0.0, 0.0],
+     distortion_type: radialtangential,
+     focal_length: [207.24633501718, 207.24633501718], # P fx (full-res 828.985 /2)
+     principal_point: [328.3123146593, 251.7950095195], # P cx,cy /2
+     cam_model: pinhole,
+     camera_type: gray+depth, #dense mapping stereo-network depth attaches here
+     mapping: true, #integrate depth from this camera into the submap
+     mapping_rectification: false,
+     slam_use: okvis} #none, okvis, okvis-depth, okvis-virtual
+
+  - {T_SC:
+       [0.001497537102,  0.999996405692,  0.002223957294, -0.002649830409,
+       -0.999969099008,  0.001514652030, -0.007714068822, -0.036929016325,
+       -0.007717409617, -0.002212336467,  0.999967773059,  0.015961554882,
+        0.0,             0.0,             0.0,             1.0],
+     image_dimension: [640, 496], # rectified at half res (see s56_rectified.yaml)
+     # OPTION A - same shared rectified P as cam0 (P0==P1), D=0. See cam0 note.
+     distortion_coefficients: [0.0, 0.0, 0.0, 0.0],
+     distortion_type: radialtangential,
+     focal_length: [207.24633501718, 207.24633501718], # P fx (full-res 828.985 /2)
+     principal_point: [328.3123146593, 251.7950095195], # P cx,cy /2 (shared)
+     cam_model: pinhole,
+     camera_type: gray, #gray, rgb, gray+depth, rgb+depth
+     mapping_rectification: false,
+     slam_use: okvis} #none, okvis, okvis-depth, okvis-virtual
+
+# additional camera parameters
+camera_parameters:
+  timestamp_tolerance: 0.005 # [s] stereo frame out-of-sync tolerance (HW FSYNC, tight)
+  sync_cameras: [0, 1] # the cameras that will be synchronised
+  deep_stereo_indices: [0, 1] # [left, right] camera indices for the stereo depth network
+  # image_delay = -timeshift_cam_imu. camimu_verify: timeshift = -0.0321443 (cam0)
+  # / -0.0321332 (cam1); OKVIS uses one global value -> cam0's.
+  #
+  # NOTE: this value is the cam-IMU time offset measured on the *Kalibr
+  # recording* pipeline, NOT necessarily the delay of the actual runtime
+  # (sensing_s56 live) capture path -- image dequeue latency / driver stamping
+  # can differ. TODO: re-measure the effective image_delay on the real runtime
+  # setup and update this value. If init is poor, try flipping the sign.
+  image_delay: 0.0  # runtime uses HW sensor timestamps (VI-TSC anchored to
+                    # monotonic), so the Kalibr recording-pipeline timeshift
+                    # (0.0321443, software stamps) does NOT apply. Tuning live.
+  online_calibration: # trust the Kalibr extrinsics; keep online extrinsics off
+    do_extrinsics: false # Do we online-calibrate extrinsics?
+    do_extrinsics_final_ba: false # Do we calibrate extrinsics in final BA?
+    sigma_r: 0.001 # T_SCi position prior stdev [m]
+    sigma_alpha: 0.005 # T_SCi orientation prior stdev [rad]
+    sigma_r_final_ba: 0.003 # T_SCi position prior stdev in final BA [m]
+    sigma_alpha_final_ba: 0.016 # T_SCi orientation prior stdev in final BA [rad]
+  # NOTE: images are pre-rectified (fov_scale=0.97 baked into the input stream),
+  # so OKVIS's internal fisheye stereo rectification is DISABLED
+  # (mapping_rectification: false above). fov_scale / deep_stereo_indices are
+  # therefore intentionally omitted. To run the dense stereo-depth network,
+  # feed RAW fisheye images and use the equidistant variant of this config.
+
+imu_parameters:
+  use: true
+  a_max: 176.0 # acceleration saturation [m/s^2]
+  g_max: 34.9  # gyro saturation [rad/s] (BMI088 up to +-2000 dps)
+  # IMPORTANT: raw allan_variance_ros values (BMI088, 2 h static) are the *sensor*
+  # noise floor and are FAR too tight for VIO -- they ignore time-sync jitter,
+  # unmodeled scale/misalignment and vibration, so OKVIS over-trusts IMU
+  # integration and diverges (accel bias runs away even while still). Inflated
+  # to OKVIS-proven levels (~rsD455). Raw allan for reference:
+  #   sigma_g_c=2.8020e-04 sigma_a_c=2.0739e-03
+  #   sigma_gw_c=2.5819e-06 sigma_aw_c=8.0866e-05
+  sigma_g_c: 2.8019933072e-03 # gyro noise density [rad/s/sqrt(Hz)]  (10x allan)
+  sigma_a_c: 2.5000000000e-02 # accelerometer noise density [m/s^2/sqrt(Hz)]
+  sigma_gw_c: 8.0000000000e-04 # gyro drift noise density [rad/s^2/sqrt(Hz)]
+  sigma_aw_c: 4.0000000000e-02 # accelerometer drift noise density [m/s^2/sqrt(Hz)]
+  sigma_bg: 0.03 # gyro bias prior [rad/s]
+  sigma_ba: 0.1 # accelerometer bias prior [m/s^2]
+  g: 9.806554 # Earth's acceleration due to gravity [m/s^2] (camimu_verify |g|)
+  g0: [ 0.0, 0.0, 0.0 ] # initial gyro bias [rad/s]
+  a0: [ 0.0, 0.0, 0.0 ] # initial accelerometer bias [m/s^2]
+  s_a: [ 1.0, 1.0, 1.0 ] # accelerometer scale factor
+  # transform Body-Sensor (IMU): Kalibr T_i_b = identity
+  T_BS:
+    [1.0000, 0.0000, 0.0000, 0.0000,
+     0.0000, 1.0000, 0.0000, 0.0000,
+     0.0000, 0.0000, 1.0000, 0.0000,
+     0.0000, 0.0000, 0.0000, 1.0000]
+
+# frontend: detection etc.
+frontend_parameters:
+  detection_threshold: 30.0 # detection threshold (uniformity radius in pixels)
+  absolute_threshold: 8.0 # absolute Harris corner threshold (noise floor).
+                          # NOTE: 100.0 was far too high -> ~0 keypoints detected
+                          # -> 0 stereo matches -> "cannot initialise". Matches the
+                          # known-good rsD455 config (5.0), nudged up for 5 MP noise.
+  matching_threshold: 60.0 # BRISK descriptor matching threshold
+  octaves: 0 # number of octaves for detection. 0 means single-scale at highest resolution
+  max_num_keypoints: 1000 # 640x496 front-end: half the 5 MP budget (was 2000)
+  keyframe_overlap: 0.60 # minimum field-of-view overlap
+  use_cnn: false # use the CNN (if available) to filter out dynamic content / sky
+  parallelise_detection: true # Run parallel detect & describe.
+  num_matching_threads: 4 # Parallelise matching with this number of threads.
+
+# estimator parameters
+estimator_parameters:
+  num_keyframes: 5 # number of keyframes in optimisation window
+  num_loop_closure_frames: 5 # number of loop closure frames in optimisation window
+  num_imu_frames: 3 # number of frames linked by most recent nonlinear IMU error terms
+  do_loop_closures: false # whether to do VI-SLAM or VIO
+  do_final_ba: true # Whether to run a full final BA
+  enforce_realtime: true # whether to limit the time budget for optimisation
+  realtime_min_iterations: 3 # minimum number of iterations always performed
+  realtime_max_iterations: 10 # never do more than these, even if not converged
+  realtime_time_limit: 0.035 # time budget for realtime optimisation [s]
+  realtime_num_threads: 4 # number of threads for the realtime optimisation
+  full_graph_iterations: 15 # don't do more than these for the full (background) optimisation
+  full_graph_num_threads: 2 # number of threads for the full (background) optimisation
+  p_dbow: 0.4 # Match threshold for dBoW -- varies with setups.
+  drift_percentage_heuristic: 1.35 # % allowed drift in loop closures rel. to dist. travelled.
+
+# some options for how and what to output
+output_parameters:
+  display_topview: false # headless by default (no DISPLAY / GTK). Enable on a desktop.
+  display_matches: false # displays debug video and matches. May be slow.
+  display_overhead: false # debug overhead image. Is slow.
+  enable_submapping: true # dense mapping (stereo depth network, supereight2 submaps)

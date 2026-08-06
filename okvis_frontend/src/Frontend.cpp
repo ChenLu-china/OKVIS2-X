@@ -57,6 +57,11 @@
 
 #include <okvis/Frontend.hpp>
 
+#ifdef OKVIS_GPU_MATCHER
+#include <cstdlib>
+#include <okvis/gpu_brisk_matcher.hpp>
+#endif
+
 // okvis ceres
 #include <okvis/ceres/PoseParameterBlock.hpp>
 #include <okvis/ceres/HomogeneousPointParameterBlock.hpp>
@@ -1294,7 +1299,11 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
 
   // get all landmarks
   MapPoints pointMap;
-  estimator.getLandmarks(pointMap);
+  {
+    TimerSwitchable tGetLm("2.01z getLandmarks");
+    estimator.getLandmarks(pointMap);
+    tGetLm.stop();
+  }
 
   // these may be needed for loop-closure map fusion
   std::vector<LandmarkId> oldIds, newIds;
@@ -1341,6 +1350,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     descriptorPool[im] = cv::Mat(
         int(numDescriptorsToKeep)*pointMap.size(), 48, CV_8UC1);
     uchar* dataPtr = descriptorPool[im].data;
+    TimerSwitchable tBuild("2.01a build landmarksToMatch");
     for(MapPoints::const_iterator it = pointMap.begin(); it != pointMap.end(); ++it) {
       if(loopClosureLandmarksToUseExclusively) {
         if(!loopClosureLandmarksToUseExclusively->count(it->first)) {
@@ -1479,6 +1489,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
       // insert
       landmarksToMatch[landmarkId] = landmarkToMatch;
     }
+    tBuild.stop();
     landmarksToMatchVec[im] = landmarksToMatch;
 
     // multithreaded matching
@@ -1490,21 +1501,114 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     std::vector<size_t> ctrs(num_matching_threads);
     std::vector<double> reprErrors(num_matching_threads);
 
-    std::vector<std::thread*> threads(num_matching_threads, nullptr);
-    for(size_t t = 0; t<num_matching_threads; ++t) {
-      threads[t] = new std::thread(
-          &Frontend::matchToMapByThread<CAMERA_GEOMETRY>, this, t, num_matching_threads,
-              std::cref(estimator), std::cref(params), currentFrameId,
-              loopClosureLandmarksToUseExclusively, std::cref(T_WS1),
-              std::cref(landmarksToMatch), numKeypoints,
-              std::cref(pointMap), im, std::cref(multiFrame), std::ref(distances),
-              std::ref(lmIds), std::ref(hps_W), std::ref(ctrs), std::ref(reprErrors));
-    }
+    bool matchedOnGpu = false;
+#ifdef OKVIS_GPU_MATCHER
+    // GPU brute-force Hamming match-to-map (Thor iGPU, zero-copy). Only the main
+    // (non-loop-closure) path; loop closure keeps the CPU route. Falls back to
+    // CPU on any failure. distances/lmIds are only written on success, so the
+    // fallback below still sees pristine initial values.
+    {
+      // Opt-in only: matching is NOT a VIO bottleneck (GPU kernel ~0.12ms, but the
+      // match-to-map stage is dominated by BA + landmark preprocessing). Default
+      // to the original CPU matcher; set OKVIS_MATCH_GPU=1 to enable the GPU path.
+      static const bool gpuEnabled = []() {
+        const char* e = std::getenv("OKVIS_MATCH_GPU");
+        return e && e[0] == '1';
+      }();
+      if (gpuEnabled && !loopClosureLandmarksToUseExclusively
+          && gpu::gpuMatcherAvailable()) {
+        // flatten candidate landmarks in ascending-LandmarkId (std::map) order
+        const uint8_t* poolBase = descriptorPool[im].data;
+        std::vector<float> lmProjXY;
+        std::vector<int> lmDescOffRow, lmDescRows;
+        std::vector<LandmarkId> lmIdOf;
+        lmProjXY.reserve(2 * landmarksToMatch.size());
+        lmDescOffRow.reserve(landmarksToMatch.size());
+        lmDescRows.reserve(landmarksToMatch.size());
+        lmIdOf.reserve(landmarksToMatch.size());
+        for (auto it = landmarksToMatch.begin(); it != landmarksToMatch.end(); ++it) {
+          if (!it->second.is3d) continue;  // same gate as the CPU thread
+          const cv::Mat& dsc = it->second.descriptors;
+          if (dsc.rows == 0) continue;
+          lmProjXY.push_back(float(it->second.projection[0]));
+          lmProjXY.push_back(float(it->second.projection[1]));
+          lmDescOffRow.push_back(int((dsc.data - poolBase) / 48));
+          lmDescRows.push_back(int(dsc.rows));
+          lmIdOf.push_back(it->first);
+        }
+        const int Mg = int(lmIdOf.size());
+        if (Mg == 0) {
+          matchedOnGpu = true;  // nothing to match, but the stage is complete
+        } else {
+          const uint8_t* curDesc = multiFrame->keypointDescriptor(im, 0);
+          std::vector<float> curKpXY(2 * numKeypoints);
+          std::vector<uint8_t> useKp(numKeypoints, 1);
+          for (size_t k = 0; k < numKeypoints; ++k) {
+            Eigen::Vector2d kp;
+            multiFrame->getKeypoint(im, k, kp);
+            curKpXY[2 * k + 0] = float(kp[0]);
+            curKpXY[2 * k + 1] = float(kp[1]);
+            if (multiFrame->landmarkId(im, k)) useKp[k] = 0;  // already matched
+          }
+          std::vector<int> bestLmIdx(numKeypoints, -1);
+          std::vector<float> bestHam(numKeypoints, float(briskMatchingThreshold_));
+          std::vector<float> bestRepr(numKeypoints, 0.f);
 
-    for(size_t t = 0; t<num_matching_threads; ++t) {
-      threads[t]->join();
-      delete threads[t];
-      reprErr += reprErrors[t];
+          gpu::GpuMatchInput gin;
+          gin.curDesc = curDesc;
+          gin.curKpXY = curKpXY.data();
+          gin.useKp = useKp.data();
+          gin.numKeypoints = int(numKeypoints);
+          gin.lmProjXY = lmProjXY.data();
+          gin.poolBase = poolBase;
+          gin.lmDescOffRow = lmDescOffRow.data();
+          gin.lmDescRows = lmDescRows.data();
+          gin.numLandmarks = Mg;
+          gin.reprThreshSq = float(reprThreshold * reprThreshold);
+          gin.matchThresh = float(briskMatchingThreshold_);
+
+          if (gpu::matchToMapGPU(gin, bestLmIdx.data(), bestHam.data(),
+                                 bestRepr.data())) {
+            double reprSum = 0.0;
+            size_t nMatched = 0;
+            for (size_t k = 0; k < numKeypoints; ++k) {
+              if (bestLmIdx[k] >= 0) {
+                distances[k] = bestHam[k];
+                lmIds[k] = lmIdOf[size_t(bestLmIdx[k])];
+                reprSum += bestRepr[k];
+                ++nMatched;
+              }
+            }
+            // The CPU accumulates sum_t(per-thread mean reproj); a single global
+            // mean scaled by the thread count is the natural equivalent (this
+            // only feeds the RANSAC trigger, not the matches themselves).
+            if (nMatched > 0) {
+              reprErr += (reprSum / double(nMatched)) * double(num_matching_threads);
+            }
+            matchedOnGpu = true;
+          }
+        }
+      }
+    }
+#endif  // OKVIS_GPU_MATCHER
+
+    if (!matchedOnGpu) {
+      std::vector<std::thread*> threads(num_matching_threads, nullptr);
+      for(size_t t = 0; t<num_matching_threads; ++t) {
+        threads[t] = new std::thread(
+            &Frontend::matchToMapByThread<CAMERA_GEOMETRY>, this, t, num_matching_threads,
+                std::cref(estimator), std::cref(params), currentFrameId,
+                loopClosureLandmarksToUseExclusively, std::cref(T_WS1),
+                std::cref(landmarksToMatch), numKeypoints,
+                std::cref(pointMap), im, std::cref(multiFrame), std::ref(distances),
+                std::ref(lmIds), std::ref(hps_W), std::ref(ctrs), std::ref(reprErrors));
+      }
+
+      for(size_t t = 0; t<num_matching_threads; ++t) {
+        threads[t]->join();
+        delete threads[t];
+        reprErr += reprErrors[t];
+      }
     }
 
     // now insert observations
@@ -1562,6 +1666,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   // do optimisation
   std::vector<StateId> updatedStatesRealtime;
   if(!loopClosureLandmarksToUseExclusively && ctr > 3) {
+    TimerSwitchable tRtOpt("2.01o realtimeOptimise (inside matchToMap)");
     estimator.optimiseRealtimeGraph(
         numInitIter, updatedStatesRealtime, params.estimator.realtime_num_threads,
         false, true, isInitialized_);
@@ -1572,6 +1677,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
       2, updatedStatesRealtime, params.estimator.realtime_num_threads,
       false, true, isInitialized_);
     T_WS1 = estimator.pose(StateId(currentFrameId));
+    tRtOpt.stop();
   }
   if (ctr <= 3 && isInitialized_) {
     secondRansac = true;
