@@ -1,4 +1,4 @@
-﻿/**
+/**
  * OKVIS2-X - Open Keyframe-based Visual-Inertial SLAM Configurable with Dense 
  * Depth or LiDAR, and GNSS
  *
@@ -1474,6 +1474,14 @@ bool ViGraph::addSubmapAlignmentConstraints(const SupereightMapType* submap_ptr,
 
   if((states_.count(StateId(frame_A_id)) == 0) || (states_.count(StateId(frame_B_id)) == 0)){
     LOG(ERROR) << "state outside of optimisation window";
+    return false;
+  }
+
+  // Guard against self-alignment: if both anchors are the same state, the
+  // residual below would reference the same pose parameter block twice, which
+  // makes Ceres abort with "Duplicate parameter blocks in a residual parameter
+  // are not allowed". This happens on short runs with very few submaps.
+  if(frame_A_id == frame_B_id){
     return false;
   }
 
