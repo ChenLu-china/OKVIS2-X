@@ -146,7 +146,13 @@ if(USE_NN)
         DESTINATION ${PROJECT_SOURCE_DIR}/resources/)
   endif()
 
-  if(USE_COLIDMAP)
+  # NOTE: line 185 renames esam-model-original.pt -> esam-model.pt, which breaks
+  # re-configure idempotency (the original file is gone, so check_hash re-triggers
+  # a network download that fails offline). Guard the whole block on the final
+  # product already being present, so a re-configure of an installed build tree
+  # never needs the network. All products (esam-model.pt, esam-model-fast.pt,
+  # vl-vision-model.pt) are build/ files not referenced outside this block.
+  if(USE_COLIDMAP AND NOT EXISTS "${PROJECT_SOURCE_DIR}/build/esam-model.pt")
     # Get Models for FindAnything: Efficient SAM (Original Model)
     set(ESAM_ORIGINAL_URL "https://cvg.cit.tum.de/webshare/g/srl-models/findanything/esam-model-original.pt")
     set(ESAM_ORIGINAL_FILE "${PROJECT_SOURCE_DIR}/build/esam-model-original.pt")

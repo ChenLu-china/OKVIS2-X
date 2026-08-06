@@ -257,6 +257,7 @@ int main(int argc, char **argv)
 
     if(!datasetreaderFinished){
       estimator->processFrame();      
+      if(!std::getenv("OKVIS_HEADLESS")) {
       #if defined(OKVIS_STEREO_NETWORK_PROCESSOR)
       std::map<std::string, cv::Mat> images;
       processor->display(images);
@@ -339,6 +340,7 @@ int main(int argc, char **argv)
         cv::imshow("OKVIS 2 Top View", topView);
       }
       cv::waitKey(2);
+      } // end OKVIS_HEADLESS visualization guard
     }
 
     // check if done

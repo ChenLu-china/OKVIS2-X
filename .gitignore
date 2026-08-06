@@ -5,3 +5,11 @@
 *.png
 *.asv
 /documentation
+
+# local build/deploy trees produced by our out-of-tree build (not sources):
+#   install/     staged headers+libs of the prebuilt OKVIS
+#   torch_deps/  ~93 MB of libtorch runtime .so's the binaries dlopen
+#   models_cache/ ~1.4 GB of downloaded network weights
+/install/
+/torch_deps/
+/models_cache/

@@ -20,6 +20,7 @@ target_include_directories(${PROJECT_NAME}
     $<INSTALL_INTERFACE:include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/DBoW2>
     $<INSTALL_INTERFACE:include/DBoW2>
+    ${OpenCV_INCLUDE_DIRS}
 )
 target_link_libraries(${PROJECT_NAME} ${OpenCV_LIBS})
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_11)
