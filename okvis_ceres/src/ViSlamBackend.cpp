@@ -2026,6 +2026,7 @@ int ViSlamBackend::mergeLandmarks(std::vector<LandmarkId> fromIds, std::vector<L
 void ViSlamBackend::optimiseFullGraph(int numIter, ::ceres::Solver::Summary &summary,
                                       int numThreads, bool verbose)
 {
+  pthread_setname_np(pthread_self(), "okvis-fullba");
   OKVIS_ASSERT_TRUE(Exception, !isLoopClosing_, "can't optimise posegraph; already loop-closing")
   DLOG(INFO) << "Starting fullGraph_ optimisation.";
   needsFullGraphOptimisation_ = false;

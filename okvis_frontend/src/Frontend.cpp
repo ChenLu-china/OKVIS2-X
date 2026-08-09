@@ -211,6 +211,9 @@ bool Frontend::detectAndDescribe(size_t cameraIndex, std::shared_ptr<okvis::Mult
                                  const std::vector<cv::KeyPoint>* keypoints) {
   OKVIS_ASSERT_TRUE_DBG(Exception, cameraIndex < numCameras_,
                         "Camera index exceeds number of cameras.")
+  // Deliberately NOT renaming the thread here: one camera is detected on the
+  // caller's thread even when parallelise_detection is on, so naming would
+  // relabel the estimator's own thread and corrupt CPU attribution.
   std::lock_guard<std::mutex> lock(*featureDetectorMutexes_[cameraIndex]);
 
   // check there are no keypoints here
@@ -1844,6 +1847,7 @@ void Frontend::matchToMapByThread(
     std::vector<size_t>& ctrs,
     std::vector<double>& reprErrors) const {
 
+  pthread_setname_np(pthread_self(), "okvis-match3d");
   const kinematics::Transformation T_SC = *multiFrame->T_SC(im);
   const kinematics::Transformation T_WC1 = T_WS1 * T_SC;
   const kinematics::Transformation T_CW1 = T_WC1.inverse();
@@ -1929,6 +1933,7 @@ void Frontend::matchToMapByThreadUnitialised(
     std::vector<LandmarkId>& lmIds, AlignedVector<Eigen::Vector4d>& hps_W,
     std::vector<size_t>& ctrs) const {
 
+  pthread_setname_np(pthread_self(), "okvis-matchun");
   const kinematics::Transformation T_SC = *multiFrame->T_SC(im);
   const kinematics::Transformation T_WC1 = T_WS1 * T_SC;
   const kinematics::Transformation T_CW1 = T_WC1.inverse();

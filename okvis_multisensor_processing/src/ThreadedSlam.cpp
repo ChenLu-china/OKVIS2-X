@@ -937,6 +937,9 @@ bool ThreadedSlam::processFrame() {
 
 void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
                                               const Eigen::Vector3d& gyroReading) {
+  // Named for thread-level CPU attribution via `top -H`; this thread is
+  // re-created every frame, so the name has to be set here rather than once.
+  pthread_setname_np(pthread_self(), "okvis-opt");
   kinematics::Transformation T_WS;
   SpeedAndBias speedAndBiases;
   const size_t numCameras = parameters_.nCameraSystem.numCameras();
@@ -1230,6 +1233,7 @@ bool ThreadedSlam::needsNewLidarKeyframe()
 // Loop to process visualisations.
 void ThreadedSlam::visualisationLoop()
 {
+  pthread_setname_np(pthread_self(), "okvis-vis");
   while (!shutdown_) {
     ViVisualizer::VisualizationData::Ptr visualisationData;
     if(visualisationData_.PopBlocking(&visualisationData)) {
@@ -1250,6 +1254,7 @@ void ThreadedSlam::visualisationLoop()
 // Loop to process publishing.
 void ThreadedSlam::publishingLoop()
 {
+  pthread_setname_np(pthread_self(), "okvis-pub");
   while (!shutdown_) {
     PublicationData publicationData;
     if(publicationQueue_.PopBlocking(&publicationData)) {
