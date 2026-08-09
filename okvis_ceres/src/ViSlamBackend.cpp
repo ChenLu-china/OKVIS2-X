@@ -37,6 +37,44 @@ static const double minDeltaT = 2.0; // [sec]
 static int numRealtimePoseGraphFrames = 12;
 static const int numPoseGraphFrames = 12;
 
+namespace {
+// Ceres reports internally where its time goes. Knowing only that "the solve is
+// slow" does not say whether to shrink the problem (residual/Jacobian time,
+// which scales with observations) or to change linear solver (linear time,
+// which scales with the reduced system). Accumulated separately for the two
+// call sites of optimiseRealtimeGraph and dumped periodically.
+void accumulateCeresStats(const ::ceres::Solver::Summary &s, bool matchToMapPath)
+{
+  struct Acc { double res=0.0, jac=0.0, lin=0.0, min=0.0, pre=0.0, post=0.0,
+               tot=0.0, iters=0.0; size_t n=0; };
+  static Acc acc[2];
+  Acc &a = acc[matchToMapPath ? 1 : 0];
+  a.res += s.residual_evaluation_time_in_seconds;
+  a.jac += s.jacobian_evaluation_time_in_seconds;
+  a.lin += s.linear_solver_time_in_seconds;
+  a.min += s.minimizer_time_in_seconds;
+  a.pre += s.preprocessor_time_in_seconds;
+  a.post += s.postprocessor_time_in_seconds;
+  a.tot += s.total_time_in_seconds;
+  a.iters += double(s.iterations.size());
+  if (++a.n % 200 == 0) {
+    const double n = double(a.n);
+    LOG(INFO) << "[ceres " << (matchToMapPath ? "matchToMap" : "main   ")
+              << "] calls=" << a.n
+              << " iters/call=" << a.iters / n
+              << " | total " << 1e3 * a.tot / n << " ms"
+              << " = pre " << 1e3 * a.pre / n
+              << " + minimizer " << 1e3 * a.min / n
+              << " + post " << 1e3 * a.post / n
+              << " || minimizer = residual " << 1e3 * a.res / n
+              << " + jacobian " << 1e3 * a.jac / n
+              << " + linear " << 1e3 * a.lin / n
+              << " | last: residual blocks " << s.num_residual_blocks
+              << ", effective params " << s.num_effective_parameters;
+  }
+}
+}  // namespace
+
 int ViSlamBackend::addCamera(const CameraParameters &cameraParameters)
 {
   fullGraph_.addCamera(cameraParameters);
@@ -841,6 +879,7 @@ void ViSlamBackend::optimiseRealtimeGraph(
   bool frozen = false;
   StateId unfreezeId;
   if(onlyNewestState) {
+    TimerSwitchable tFreeze("3.1 freeze params (matchToMap path)");
     // paranoid: find last frozen
     for(auto riter = realtimeGraph_.states_.rbegin(); riter != realtimeGraph_.states_.rend();
         ++riter) {
@@ -878,10 +917,18 @@ void ViSlamBackend::optimiseRealtimeGraph(
   // (the reduced system is far too small to amortise launch overhead) and it
   // competes with the depth network for the GPU.
   realtimeGraph_.options_.linear_solver_type = ::ceres::DENSE_SCHUR;
-  realtimeGraph_.optimise(numIter, numThreads, verbose);
+  {
+    // The two call sites are timed apart: "3 Optimise" enters with
+    // onlyNewestState=false, matchToMap's realtimeOptimise with true.
+    TimerSwitchable tSolve(onlyNewestState ? "3.2b ceres solve (matchToMap path)"
+                                           : "3.2a ceres solve (main path)");
+    realtimeGraph_.optimise(numIter, numThreads, verbose);
+  }
+  accumulateCeresStats(realtimeGraph_.summary(), onlyNewestState);
 
   // unfreeze if necessary
   if(onlyNewestState) {
+    TimerSwitchable tUnfreeze("3.3 unfreeze + adopt pose (matchToMap path)");
     // unfreeze extrinsics
     for (size_t i = 0; i < realtimeGraph_.cameraParametersVec_.size(); ++i) {
       if (realtimeGraph_.cameraParametersVec_.at(i).online_calibration.do_extrinsics) {
@@ -922,10 +969,12 @@ void ViSlamBackend::optimiseRealtimeGraph(
 
   // import landmarks
   if(!onlyNewestState) {
+    TimerSwitchable tUpdateLm("3.4 updateLandmarks (main path)");
     realtimeGraph_.updateLandmarks();
   }
 
   // also copy states to observationless and fullGraph (if possible)
+  TimerSwitchable tSyncStates("3.5 sync states -> fullGraph (main path)");
   for (auto id : updatedStatesLoopClosureAttempt_) {
     updatedStates.push_back(id); // remember that these were also updated (from initialisation)
   }
@@ -964,8 +1013,10 @@ void ViSlamBackend::optimiseRealtimeGraph(
       }
   }
   updatedStatesLoopClosureAttempt_.clear(); // processed now, so clear
+  tSyncStates.stop();
 
   // ... and landmarks to fullGraph (if possible)
+  TimerSwitchable tSyncLandmarks("3.6 sync landmarks -> fullGraph (main path)");
   if(!isLoopClosing_ && !isLoopClosureAvailable_) {
     for(auto iter = realtimeGraph_.landmarks_.begin(); iter != realtimeGraph_.landmarks_.end();
         ++iter) {
@@ -974,6 +1025,7 @@ void ViSlamBackend::optimiseRealtimeGraph(
       fullGraph_.setLandmarkQuality(iter->first, iter->second.quality);
     }
   }
+  tSyncLandmarks.stop();
 
   // finally adopt stuff from realtime optimisation results in full and observation-less graphs
   for(auto riter = realtimeGraph_.states_.rbegin(); riter != realtimeGraph_.states_.rend();

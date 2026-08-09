@@ -1501,6 +1501,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     std::vector<size_t> ctrs(num_matching_threads);
     std::vector<double> reprErrors(num_matching_threads);
 
+    TimerSwitchable tMatch3d("2.01b match threads (3d)");
     bool matchedOnGpu = false;
 #ifdef OKVIS_GPU_MATCHER
     // GPU brute-force Hamming match-to-map (Thor iGPU, zero-copy). Only the main
@@ -1610,8 +1611,10 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
         reprErr += reprErrors[t];
       }
     }
+    tMatch3d.stop();
 
     // now insert observations
+    TimerSwitchable tInsert3d("2.01c insert observations (3d)");
     for(size_t k = 0; k < numKeypoints; ++k) {
       uint64_t previousId = multiFrame->landmarkId(im,k);
       if(lmIds[k].isInitialised()) {
@@ -1633,6 +1636,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
         ctr++;
       }
     }
+    tInsert3d.stop();
   }
   //OKVIS_ASSERT_TRUE(Exception, estimator.areLandmarksInFrontOfCameras(), "before ransac")
   reprErr /= double(params.frontend.num_matching_threads * params.nCameraSystem.numCameras());
@@ -1654,6 +1658,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   }
   bool secondRansac = false;
   if(runRansac) {
+    TimerSwitchable tRansac1("2.01d RANSAC 3d2d (#1)");
     const bool ransacSuccess = runRansac3d2d(estimator, multiFrame->cameraSystem(), multiFrame,
                                              runRansac, ransacRemoveOutliers);
     T_WS1 = estimator.pose(StateId(currentFrameId));
@@ -1706,6 +1711,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     AlignedVector<Eigen::Vector4d> hps_W(numKeypoints, Eigen::Vector4d::Zero());
     std::vector<size_t> ctrs(num_matching_threads);
 
+    TimerSwitchable tMatchUninit("2.01e match threads (uninitialised)");
     std::vector<std::thread*> threads(num_matching_threads, nullptr);
     for(size_t t = 0; t<num_matching_threads; ++t) {
       threads[t] = new std::thread(
@@ -1721,8 +1727,12 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
       threads[t]->join();
       delete threads[t];
     }
+    tMatchUninit.stop();
 
-    // now insert observations
+    // Insert observations. Unlike the 3d pass this re-projects each candidate
+    // into EVERY existing observation of its landmark to reject bad matches, so
+    // its cost grows with track length, not just with keypoint count.
+    TimerSwitchable tInsertUninit("2.01f insert observations (uninitialised)");
     for(size_t k = 0; k < numKeypoints; ++k) {
       uint64_t previousId = multiFrame->landmarkId(im,k);
       if(lmIds[k].isInitialised()) {
@@ -1792,6 +1802,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
         ctr++;
       }
     }
+    tInsertUninit.stop();
   }
   //OKVIS_ASSERT_TRUE(Exception, estimator.areLandmarksInFrontOfCameras(), "after non-initialised match to map")
 
@@ -1802,6 +1813,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
 
   // final two steps optimisation
   if (secondRansac) {
+    TimerSwitchable tRansac2("2.01g RANSAC #2 + optimise (uninitialised)");
     LOG(INFO) << "Running RANSAC also with uninitialised landmarks";
     const bool ransacSuccess = runRansac3d2d(estimator, multiFrame->cameraSystem(), multiFrame,
                                              secondRansac, ransacRemoveOutliers);

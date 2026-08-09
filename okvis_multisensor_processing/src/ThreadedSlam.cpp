@@ -739,7 +739,10 @@ bool ThreadedSlam::processFrame() {
   TimerSwitchable matchTimer("2 Match");
   bool asKeyframe = false;
 
-  if (!estimator_.addStates(multiFrame, imuMeasurementDeque_, asKeyframe)) {
+  TimerSwitchable tAddStates("2.00 addStates (IMU preintegration)");
+  const bool statesAdded = estimator_.addStates(multiFrame, imuMeasurementDeque_, asKeyframe);
+  tAddStates.stop();
+  if (!statesAdded) {
     LOG(ERROR)<< "Failed to add state! will drop multiframe.";
     matchTimer.stop();
     return true;
@@ -1094,7 +1097,9 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
     }
     affectedStates_.clear();
 
-    // landmarks:
+    // landmarks: copies the WHOLE map every frame, so this grows with map size
+    // rather than with anything about the current frame.
+    TimerSwitchable tPackLandmarks("4.2 pack landmarks (whole map)");
     publicationData.landmarksPublish.reset(new MapPointVector());
     MapPoints landmarks;
     estimator_.getLandmarks(landmarks);
@@ -1105,6 +1110,7 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
             MapPoint(lm.first.value(), lm.second.point, lm.second.quality,
                      latestObservedFrameId.getFrameId()));
     }
+    tPackLandmarks.stop();
 
     // now publish in separate thread. queue size 3 to ensure nothing ever lost.
     if(blocking_){
