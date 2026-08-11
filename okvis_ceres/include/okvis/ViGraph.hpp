@@ -78,6 +78,57 @@ namespace okvis {
       ReInitialising = 4
   };
 
+/**
+ * @brief The same information as MapPoints, in parallel arrays with the
+ *        observations in CSR form.
+ *
+ * MapPoints costs one red-black node per landmark plus one std::set node per
+ * observation, all of which are allocated and freed again on every frame that
+ * copies the map out of the graph. A reader that walks every landmark and every
+ * observation exactly once -- which is what the frontend's candidate build does
+ * -- pays for that structure and uses none of it. Here the whole snapshot is a
+ * handful of vectors whose capacity only grows, so a warm frame allocates
+ * nothing, and the walk is a linear scan instead of a tree traversal.
+ *
+ * Landmarks stay in ascending id order and the observations of one landmark stay
+ * in ascending KeypointIdentifier order, i.e. exactly the orders the std::map
+ * and the std::set produced. Readers depend on that rather than merely benefit
+ * from it: descriptor selection and match tie-breaking both resolve ties by
+ * "first seen".
+ */
+struct MapPointsSoA
+{
+  // per landmark, ascending id
+  std::vector<uint64_t> id;             ///< Landmark id.
+  std::vector<double> point;            ///< Homogeneous position, 4 per landmark.
+  std::vector<double> quality;          ///< 3D quality.
+  std::vector<int32_t> classification;  ///< Class id, -1 if unclassified.
+  std::vector<uint8_t> isInitialised;   ///< Is the position initialised?
+  std::vector<int32_t> obsBegin;        ///< CSR row starts, size() + 1 entries.
+
+  // per observation, grouped by landmark, ascending KeypointIdentifier
+  std::vector<uint64_t> obsFrameId;     ///< Observing multiframe id.
+  std::vector<uint32_t> obsCamIdx;      ///< Observing camera index.
+  std::vector<uint32_t> obsKptIdx;      ///< Keypoint index within that camera.
+
+  /// \brief Number of landmarks.
+  size_t size() const { return id.size(); }
+
+  /// \brief Drop all entries, keeping the capacity for the next frame.
+  void clear()
+  {
+    id.clear();
+    point.clear();
+    quality.clear();
+    classification.clear();
+    isInitialised.clear();
+    obsBegin.clear();
+    obsFrameId.clear();
+    obsCamIdx.clear();
+    obsKptIdx.clear();
+  }
+};
+
 /// \brief A class to construct visual-inertial optimisable graphs with.
 class ViGraph
 {
@@ -219,6 +270,66 @@ class ViGraph
    * @return number of landmarks.
    */
   size_t getLandmarks(MapPoints & landmarks) const;
+  /**
+   * @brief Bring an existing MapPoints copy up to date with the graph.
+   *
+   * Same result as getLandmarks() on an empty map, but landmarks and observation
+   * keys that are already present are left in place instead of being freed and
+   * reallocated. Both containers are sorted on the same key, so this is a merge
+   * walk: allocation happens only for entries that actually appeared.
+   * @param[in,out] landmarks The landmarks (may hold a previous snapshot).
+   * @return number of landmarks.
+   */
+  size_t syncLandmarks(MapPoints & landmarks) const;
+  /**
+   * @brief Copy all landmarks out as parallel arrays with CSR observations.
+   *
+   * Element-wise the same snapshot as getLandmarks(), in the same landmark and
+   * observation order, but without a single per-landmark or per-observation heap
+   * block: the destination vectors are refilled in place and only ever grow.
+   * @param[in,out] landmarks The flat snapshot (previous contents are replaced).
+   * @return number of landmarks.
+   */
+  size_t getLandmarksSoA(MapPointsSoA & landmarks) const;
+  /**
+   * @brief Get just the position and quality of a landmark.
+   *
+   * Unlike getLandmark() this does not build a copy of the observation set,
+   * which callers that only need the position pay for otherwise.
+   * @param[in] landmarkId The ID of the landmark.
+   * @param[out] homogeneousPoint The landmark position estimate (in World frame).
+   * @param[out] quality The landmark quality.
+   * @return True if the landmark exists.
+   */
+  /**
+   * @brief Fill the publishable landmark vector straight from the graph.
+   *
+   * The caller-visible result equals building a MapPoints copy and reducing it,
+   * but skips deep-copying every landmark's observation set just to read the
+   * newest observation's frame ID off it.
+   * @param[out] landmarks The landmarks to publish.
+   * @return number of landmarks.
+   */
+  size_t getLandmarksForPublish(MapPointVector & landmarks) const {
+    landmarks.clear();
+    landmarks.reserve(landmarks_.size());
+    for (const auto & lm : landmarks_) {
+      KeypointIdentifier latestObserved = lm.second.observations.rbegin()->first;
+      landmarks.push_back(MapPoint(lm.first.value(), lm.second.hPoint->estimate(),
+                                   lm.second.quality, latestObserved.getFrameId()));
+    }
+    return landmarks.size();
+  }
+  bool landmarkPositionAndQuality(LandmarkId landmarkId, Eigen::Vector4d & homogeneousPoint,
+                                  double & quality) const {
+    const auto it = landmarks_.find(landmarkId);
+    if (it == landmarks_.end()) {
+      return false;
+    }
+    homogeneousPoint = it->second.hPoint->estimate();
+    quality = it->second.quality;
+    return true;
+  }
   /**
   * @brief Does the landmark exist?
   * @param landmarkId The ID of the landmark.
@@ -708,6 +819,23 @@ class ViGraph
    */
   void optimise(int maxIterations, int numThreads, bool verbose);
 
+  /**
+   * @brief Refine only the newest state's pose and speed/bias, on a throwaway
+   *        problem holding just the residuals that touch it.
+   *
+   * Freezing everything but the newest state in the full problem gives the same
+   * answer, but Ceres still rebuilds and reduces all ~7000 residual blocks on
+   * every Solve(): measured, 1.96 ms of the 3.07 ms per call is preprocessing
+   * that the few hundred relevant residuals do not need.
+   *
+   * @param[in] maxIterations Maximum number of iterations.
+   * @param[in] numThreads Number of threads.
+   * @param[in] verbose Print out optimisation progress and result, if true.
+   * @return False if the newest state carries graph edges this path does not
+   *         model; nothing was changed and the caller must use optimise().
+   */
+  bool optimiseNewestStateOnly(int maxIterations, int numThreads, bool verbose);
+
   /// \brief Set a limit for realtime-ish operation.
   /// \param timeLimit Maximum time allowed [s].
   /// \param minIterations Minimum iterations to be carried out irrespective of time limit.
@@ -875,6 +1003,7 @@ protected:
 
   /// \brief Ceres optimization summary
   ::ceres::Solver::Summary summary_;
+
 
   // loss function for reprojection errors
   std::shared_ptr< ::ceres::LossFunction> cauchyLossFunctionPtr_; ///< Cauchy loss.

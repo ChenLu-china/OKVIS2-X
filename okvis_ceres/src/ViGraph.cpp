@@ -1605,6 +1605,74 @@ size_t ViGraph::getLandmarks(MapPoints &landmarks) const
   return landmarks.size();
 }
 
+size_t ViGraph::syncLandmarks(MapPoints &landmarks) const
+{
+  auto lit = landmarks.begin();
+  for (const auto& src : landmarks_) {
+    while (lit != landmarks.end() && lit->first < src.first) {
+      lit = landmarks.erase(lit);
+    }
+    if (lit == landmarks.end() || src.first < lit->first) {
+      lit = landmarks.emplace_hint(lit, src.first, MapPoint2());
+      lit->second.id = src.first;
+    }
+    MapPoint2& dst = lit->second;
+    dst.point = src.second.hPoint->estimate();
+    dst.isInitialised = src.second.hPoint->initialized();
+    dst.quality = src.second.quality;
+    dst.classification = src.second.classification;
+
+    auto oit = dst.observations.begin();
+    for (const auto& obs : src.second.observations) {
+      while (oit != dst.observations.end() && *oit < obs.first) {
+        oit = dst.observations.erase(oit);
+      }
+      if (oit == dst.observations.end() || obs.first < *oit) {
+        oit = dst.observations.emplace_hint(oit, obs.first);
+      }
+      ++oit;
+    }
+    dst.observations.erase(oit, dst.observations.end());
+    ++lit;
+  }
+  landmarks.erase(lit, landmarks.end());
+  return landmarks.size();
+}
+
+size_t ViGraph::getLandmarksSoA(MapPointsSoA &landmarks) const
+{
+  landmarks.clear();
+  const size_t n = landmarks_.size();
+  landmarks.id.reserve(n);
+  landmarks.point.reserve(4 * n);
+  landmarks.quality.reserve(n);
+  landmarks.classification.reserve(n);
+  landmarks.isInitialised.reserve(n);
+  landmarks.obsBegin.reserve(n + 1);
+
+  for (const auto& src : landmarks_) {
+    landmarks.obsBegin.push_back(int32_t(landmarks.obsFrameId.size()));
+    landmarks.id.push_back(src.first.value());
+    const Eigen::Vector4d& hp = src.second.hPoint->estimate();
+    landmarks.point.push_back(hp[0]);
+    landmarks.point.push_back(hp[1]);
+    landmarks.point.push_back(hp[2]);
+    landmarks.point.push_back(hp[3]);
+    landmarks.quality.push_back(src.second.quality);
+    landmarks.classification.push_back(int32_t(src.second.classification));
+    landmarks.isInitialised.push_back(src.second.hPoint->initialized() ? 1 : 0);
+    // observations_ of a landmark is keyed on KeypointIdentifier, so this walk
+    // already emits them in the ascending order a std::set copy would have.
+    for (const auto& obs : src.second.observations) {
+      landmarks.obsFrameId.push_back(obs.first.frameId);
+      landmarks.obsCamIdx.push_back(uint32_t(obs.first.cameraIndex));
+      landmarks.obsKptIdx.push_back(uint32_t(obs.first.keypointIndex));
+    }
+  }
+  landmarks.obsBegin.push_back(int32_t(landmarks.obsFrameId.size()));
+  return landmarks.size();
+}
+
 bool ViGraph::landmarkExists(LandmarkId landmarkId) const
 {
   return landmarks_.count(landmarkId) != 0;
@@ -1895,6 +1963,118 @@ void ViGraph::optimise(int maxIterations, int /*numThreads*/, bool verbose)
   if (verbose) {
     LOG(INFO) << summary_.FullReport();
   }
+}
+
+bool ViGraph::optimiseNewestStateOnly(int maxIterations, int numThreads, bool verbose)
+{
+  if (states_.size() < 2) {
+    return false;
+  }
+  auto iter = states_.rbegin();
+  State& state = iter->second;
+  ++iter;
+  State& previousState = iter->second;
+
+  // Only the plain "newest frame just arrived" shape is modelled below. Pose
+  // graph edges, GPS, submap alignment and per-state extrinsics all add
+  // residuals that would silently go missing here, changing the estimate rather
+  // than just the runtime, so hand those frames back to the full solve.
+  if (!state.twoPoseLinks.empty() || !state.twoPoseConstLinks.empty()
+      || !state.relativePoseLinks.empty() || !state.GpsFactors.empty()
+      || !state.mapResIds.empty() || !state.submapReferenceLinks.empty()
+      || !state.submapLinks.empty() || !state.extrinsicsPriors.empty()
+      || !state.nextExtrinsicsLink.empty() || !state.previousExtrinsicsLink.empty()
+      || state.nextImuLink.residualBlockId != nullptr
+      || state.previousImuLink.residualBlockId == nullptr) {
+    return false;
+  }
+
+  okvis::TimerSwitchable tBuild("3.2c1 build pose-only problem");
+  ::ceres::Problem::Options problemOptions;
+  problemOptions.manifold_ownership = ::ceres::Ownership::DO_NOT_TAKE_OWNERSHIP;
+  problemOptions.loss_function_ownership = ::ceres::Ownership::DO_NOT_TAKE_OWNERSHIP;
+  problemOptions.cost_function_ownership = ::ceres::Ownership::DO_NOT_TAKE_OWNERSHIP;
+  ::ceres::Problem problem(problemOptions);
+
+  double* pose = state.pose->parameters();
+  double* speedAndBias = state.speedAndBias->parameters();
+  problem.AddParameterBlock(pose, 7, &poseManifold_);
+  problem.AddParameterBlock(speedAndBias, 9);
+
+  // The previous state anchors the IMU link; it stays where the full graph put it.
+  double* previousPose = previousState.pose->parameters();
+  double* previousSpeedAndBias = previousState.speedAndBias->parameters();
+  problem.AddParameterBlock(previousPose, 7, &poseManifold_);
+  problem.AddParameterBlock(previousSpeedAndBias, 9);
+  problem.SetParameterBlockConstant(previousPose);
+  problem.SetParameterBlockConstant(previousSpeedAndBias);
+  problem.AddResidualBlock(state.previousImuLink.errorTerm.get(), nullptr,
+                           previousPose, previousSpeedAndBias, pose, speedAndBias);
+
+  if (state.posePrior.errorTerm) {
+    problem.AddResidualBlock(state.posePrior.errorTerm.get(), nullptr, pose);
+  }
+  if (state.speedAndBiasPrior.errorTerm) {
+    problem.AddResidualBlock(state.speedAndBiasPrior.errorTerm.get(), nullptr, speedAndBias);
+  }
+
+  // Building this problem is itself O(observations), so every redundant call
+  // per observation shows up: the extrinsics are the same one or two blocks for
+  // hundreds of observations, and the landmarks need no manifold because they
+  // are held constant. Add each block once, and let AddResidualBlock introduce
+  // the landmarks implicitly.
+  for (const auto& extrinsic : state.extrinsics) {
+    problem.AddParameterBlock(extrinsic->parameters(), 7, &poseManifold_);
+    problem.SetParameterBlockConstant(extrinsic->parameters());
+  }
+
+  for (const auto& obs : state.observations) {
+    auto lmIter = landmarks_.find(obs.second.landmarkId);
+    if (lmIter == landmarks_.end()) {
+      continue;
+    }
+    double* point = lmIter->second.hPoint->parameters();
+    double* extrinsics = state.extrinsics.at(obs.first.cameraIndex)->parameters();
+
+    // Whether an observation got the Cauchy loss was decided when it was added
+    // and is not recorded on the Observation, so read it back off the real
+    // problem rather than guessing.
+    ::ceres::LossFunction* loss = const_cast< ::ceres::LossFunction*>(
+        problem_->GetLossFunctionForResidualBlock(obs.second.residualBlockId));
+    problem.AddResidualBlock(obs.second.errorTerm.get(), loss, pose, point, extrinsics);
+    if (obs.second.depthError.errorTerm) {
+      problem.AddResidualBlock(obs.second.depthError.errorTerm.get(), nullptr,
+                               pose, point, extrinsics);
+    }
+    problem.SetParameterBlockConstant(point);
+  }
+  tBuild.stop();
+
+  // Landmarks are all constant, so there is nothing to eliminate and no Schur
+  // structure to exploit: what is left is 15 free dimensions against a few
+  // hundred residuals. Measured, QR beats forming the 15x15 normal equations:
+  // DENSE_NORMAL_CHOLESKY shaves the linear solve but perturbs the result just
+  // enough to cost the main-path BA extra iterations.
+  ::ceres::Solver::Options options = options_;
+  options.linear_solver_type = ::ceres::DENSE_QR;
+  options.linear_solver_ordering = nullptr;
+  options.max_num_iterations = maxIterations;
+#ifdef USE_OPENMP
+  options.num_threads = numThreads;
+#else
+  static_cast<void>(numThreads);
+#endif
+  options.minimizer_progress_to_stdout = verbose;
+
+  {
+    okvis::TimerSwitchable tSolve("3.2c2 solve pose-only problem");
+    ::ceres::Solve(options, &problem, &summary_);
+  }
+
+  if (verbose) {
+    LOG(INFO) << summary_.FullReport();
+  }
+  return true;
 }
 
 bool ViGraph::setOptimisationTimeLimit(double timeLimit, int minIterations)
