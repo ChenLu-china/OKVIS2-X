@@ -27,6 +27,43 @@ option (BUILD_SHARED_LIBS
 
 option (USE_COLIDMAP "Whether to build okvis supportin colour and object's id 'for language based OKVIS' or regular one" ON)
 
+# Host-specific code generation. OFF (the default) keeps the portable generic
+# aarch64 baseline: GCC then routes every std::atomic RMW through the
+# -moutline-atomics helpers instead of emitting a single LSE instruction. ON
+# tunes for the machine doing the build, which makes the artefacts non-portable.
+# Applied to CMAKE_{C,CXX}_FLAGS before any add_subdirectory so the bundled
+# Ceres/opengv/brisk/DBoW2/supereight2 inherit it too. See
+# docs/VIO_THOR_PLATFORM_TUNING.md candidate 2.
+option (OKVIS_NATIVE_ARCH
+        "Compile for the host CPU instead of generic aarch64 (non-portable artefacts)" OFF)
+set(OKVIS_NATIVE_ARCH_FLAGS "-mcpu=native -mtune=neoverse-v2" CACHE STRING
+    "Flags used when OKVIS_NATIVE_ARCH is ON; the first accepted candidate wins")
+if(OKVIS_NATIVE_ARCH)
+  include(CheckCXXSourceCompiles)
+  set(_okvis_arch_flags "")
+  # GCC 13 does not know -mtune=neoverse-v3ae, and older ones may not know V2
+  # either, so fall back to plain -mcpu=native rather than failing the build.
+  foreach(_cand "${OKVIS_NATIVE_ARCH_FLAGS}" "-mcpu=native")
+    string(MAKE_C_IDENTIFIER "OKVIS_ARCH_ACCEPTS_${_cand}" _okvis_arch_var)
+    set(CMAKE_REQUIRED_FLAGS "${_cand}")
+    check_cxx_source_compiles("int main() { return 0; }" ${_okvis_arch_var})
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(${_okvis_arch_var})
+      set(_okvis_arch_flags "${_cand}")
+      break()
+    endif()
+  endforeach()
+  if(_okvis_arch_flags)
+    message(STATUS "OKVIS_NATIVE_ARCH: compiling with ${_okvis_arch_flags}")
+    string(APPEND CMAKE_C_FLAGS " ${_okvis_arch_flags}")
+    string(APPEND CMAKE_CXX_FLAGS " ${_okvis_arch_flags}")
+  else()
+    message(WARNING "OKVIS_NATIVE_ARCH is ON but the compiler rejected both "
+                    "'${OKVIS_NATIVE_ARCH_FLAGS}' and '-mcpu=native'; "
+                    "building for generic aarch64 instead")
+  endif()
+endif()
+
 set(OKVIS_CXX_STANDARD 17)
 set(OKVIS_PUBLIC_CXX_FLAGS)
 if(APPLE)
