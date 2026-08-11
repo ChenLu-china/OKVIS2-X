@@ -20,6 +20,8 @@
 #ifndef INCLUDE_OKVIS_FRONTEND_HPP_
 #define INCLUDE_OKVIS_FRONTEND_HPP_
 
+#include <algorithm>
+#include <cstdint>
 #include <mutex>
 
 #include <okvis/Component.hpp>
@@ -283,6 +285,12 @@ private:
 
   double briskMatchingThreshold_; ///< The set BRISK matching threshold.
 
+  /// \brief Landmark snapshot reused across matchToMap calls (OKVIS_MTM_LMSYNC!=0, the default).
+  MapPoints cachedPointMap_;
+
+  /// \brief Flat landmark snapshot reused across matchToMap calls (OKVIS_SOA!=0).
+  MapPointsSoA soaPointMap_;
+
   ///@}
 
   /**
@@ -450,6 +458,124 @@ private:
     bool ignore = false; ///< Ignore if classified as sky / person.
   };
 
+  /// \brief Number of descriptors kept per candidate landmark.
+  static constexpr int kNumDescriptorsToKeep = 3;
+  /// \brief BRISK descriptor length in bytes.
+  static constexpr int kDescriptorBytes = 48;
+
+  /**
+   * @brief The candidate table of one camera pass, as parallel arrays.
+   *
+   * This is the SoA form of AlignedMap<LandmarkId, LandmarkToMatch>. The stock
+   * container costs about six heap blocks per candidate -- the map node, the
+   * kids vector, e_W and r_W, plus the two buffers conservativeResize()
+   * reallocates when the unused columns are cropped -- and is then deep-copied
+   * a second time into landmarksToMatchVec so the uninitialised pass can still
+   * see it. At roughly 1150 candidates per camera pass that is ~14k allocations
+   * per frame, which is what VIO_PROFILING.md 3.12 identified as the dominant
+   * cost of "2 Match".
+   *
+   * Here every field lives in a vector whose capacity only grows, so a warm
+   * frame allocates nothing, the whole table is contiguous, and no copy is
+   * needed at all: the same table serves the 3D pass, the uninitialised pass and
+   * the observation insertion.
+   *
+   * Entries are appended in ascending landmark-id order, which the stock
+   * std::map also produced. That is load-bearing rather than cosmetic: the
+   * matchers keep the *first* candidate that improves the running best distance
+   * with a strict "<", so any reordering silently changes which landmark a
+   * keypoint matches (risk R3 in VIO_GPU_FRONTEND_PLAN.md).
+   */
+  struct LandmarkMatchSoA {
+    std::vector<uint64_t> id;        ///< Landmark id, ascending.
+    std::vector<double> projXY;      ///< Projection in pixels, 2 per entry.
+    std::vector<int32_t> descRow;    ///< First descriptor row in `desc`.
+    std::vector<int32_t> descRows;   ///< Descriptor count, 1..kNumDescriptorsToKeep.
+    std::vector<uint8_t> is3d;       ///< Treat as an initialised 3D point?
+    std::vector<uint8_t> ignore;     ///< Classified as sky / person?
+    /// \brief Observation directions in W, kNumDescriptorsToKeep columns per entry.
+    std::vector<double> eW;
+    /// \brief Observing camera centres in W, kNumDescriptorsToKeep columns per entry.
+    std::vector<double> rW;
+    /// \brief Descriptor arena: gathered kDescriptorBytes rows, packed as written.
+    std::vector<uint8_t> desc;
+    size_t rowsUsed = 0;             ///< Rows of `desc` written this pass.
+
+    /// \brief Number of candidates.
+    size_t size() const { return id.size(); }
+
+    /// \brief Drop all entries, keeping every allocation for the next frame.
+    void clear() {
+      id.clear(); projXY.clear(); descRow.clear(); descRows.clear();
+      is3d.clear(); ignore.clear(); eW.clear(); rW.clear();
+      rowsUsed = 0;
+    }
+
+    /**
+     * @brief Index of landmark \p lm, or -1 if it is not a candidate.
+     *
+     * Ascending ids, so this is a binary search over a contiguous array. The
+     * stock code did the same lookup with std::map::operator[], which also
+     * *inserted* a default entry on a miss -- see the call sites for why that
+     * mattered.
+     */
+    int find(uint64_t lm) const {
+      const auto it = std::lower_bound(id.begin(), id.end(), lm);
+      if (it == id.end() || *it != lm) return -1;
+      return int(it - id.begin());
+    }
+  };
+
+  /**
+   * @brief Read-only cursor interface over the stock candidate map.
+   *
+   * The two matcher inner loops are the only place where correctness depends on
+   * subtle details (iteration order, strict "<" tie-breaking, the exact Eigen
+   * expressions), so they exist exactly once and are templated on one of these
+   * views instead of being copy-pasted per layout. Everything is returned as a
+   * raw pointer to contiguous doubles, which is what both layouts already hold:
+   * Eigen matrices are column-major, so a column is contiguous.
+   */
+  struct CandidateMapView {
+    using Cursor = AlignedMap<LandmarkId, LandmarkToMatch>::const_iterator;
+    const AlignedMap<LandmarkId, LandmarkToMatch>* map;
+
+    Cursor begin() const { return map->begin(); }
+    Cursor end() const { return map->end(); }
+    static LandmarkId id(Cursor c) { return c->first; }
+    static bool is3d(Cursor c) { return c->second.is3d; }
+    static const double* projXY(Cursor c) { return c->second.projection.data(); }
+    static const uchar* desc(Cursor c) { return c->second.descriptors.data; }
+    static int descRows(Cursor c) { return c->second.descriptors.rows; }
+    static const double* eW(Cursor c, int d) { return c->second.e_W.col(d).data(); }
+    static const double* rW(Cursor c, int d) { return c->second.r_W.col(d).data(); }
+  };
+
+  /// \brief Read-only cursor interface over LandmarkMatchSoA. See CandidateMapView.
+  struct CandidateSoaView {
+    using Cursor = size_t;
+    const LandmarkMatchSoA* soa;
+
+    Cursor begin() const { return 0; }
+    Cursor end() const { return soa->id.size(); }
+    LandmarkId id(Cursor c) const { return LandmarkId(soa->id[c]); }
+    bool is3d(Cursor c) const { return soa->is3d[c] != 0; }
+    const double* projXY(Cursor c) const { return &soa->projXY[2 * c]; }
+    const uchar* desc(Cursor c) const {
+      return &soa->desc[size_t(soa->descRow[c]) * kDescriptorBytes];
+    }
+    int descRows(Cursor c) const { return soa->descRows[c]; }
+    const double* eW(Cursor c, int d) const {
+      return &soa->eW[c * 3 * kNumDescriptorsToKeep + 3 * size_t(d)];
+    }
+    const double* rW(Cursor c, int d) const {
+      return &soa->rW[c * 3 * kNumDescriptorsToKeep + 3 * size_t(d)];
+    }
+  };
+
+  /// \brief Candidate table per camera, reused across frames (OKVIS_SOA!=0).
+  std::vector<LandmarkMatchSoA> soaCandidates_;
+
   /**
    * @brief Parallelisable sub-part of matchToMap -- proper 3D points..
    * @tparam CAMERA_GEOMETRY The camera geometry type to use.
@@ -471,15 +597,48 @@ private:
    * @param[out] ctrs Number of matches (by im).
    * @param[out] reprErrs Reprojection errors (by im).
    */
+  /**
+   * @brief Fill the flat candidate table for one camera pass (OKVIS_SOA!=0).
+   *
+   * The SoA counterpart of the "2.01a build landmarksToMatch" loop: same
+   * projection, same field-of-view rejection, same descriptor selection, same
+   * ordering, but reading the flat snapshot instead of MapPoints and writing
+   * parallel arrays instead of a map of per-landmark heap blocks.
+   *
+   * It is deliberately a second loop rather than a refactor of the original: the
+   * original then stays byte-for-byte what it was, so OKVIS_SOA=0 is provably
+   * stock, and OKVIS_SOA=2 compares the two outputs field by field on every
+   * frame instead of relying on a "should be equivalent" argument.
+   * @param estimator Estimator (read only).
+   * @param multiFrame The current multiframe.
+   * @param im Camera index.
+   * @param loopClosureLandmarksToUseExclusively Only use these, if not nullptr.
+   * @param T_WC1 Current camera pose.
+   * @param T_CW1 Its inverse.
+   * @param reprThreshold Reprojection threshold in pixels.
+   * @param maxU Image width plus the threshold.
+   * @param maxV Image height plus the threshold.
+   * @param focalLength Sum of both focal lengths, as the stock loop uses it.
+   * @param[out] out The candidate table (cleared first, capacity retained).
+   */
   template<class CAMERA_GEOMETRY>
+  void buildCandidatesSoA(
+      const Estimator& estimator, const MultiFramePtr& multiFrame, size_t im,
+      const std::set<LandmarkId>* loopClosureLandmarksToUseExclusively,
+      const kinematics::Transformation& T_WC1,
+      const kinematics::Transformation& T_CW1,
+      double reprThreshold, double maxU, double maxV, double focalLength,
+      LandmarkMatchSoA& out) const;
+
+  template<class CAMERA_GEOMETRY, class CANDIDATES>
   void matchToMapByThread(
       size_t threadIdx, size_t numThreads, const Estimator &estimator,
       const okvis::ViParameters& params, const uint64_t currentFrameId,
       const std::set<LandmarkId>* loopClosureLandmarksToUseExclusively,
       const kinematics::Transformation& T_WS1,
-      const AlignedMap<LandmarkId, LandmarkToMatch>& landmarksToMatch,
+      const CANDIDATES& landmarksToMatch,
       size_t numKeypoints,
-      const MapPoints& pointMap, size_t im, const MultiFramePtr&  multiFrame,
+      size_t im, const MultiFramePtr&  multiFrame,
       std::vector<double>& distances, std::vector<LandmarkId>& lmIds,
       AlignedVector<Eigen::Vector4d>& hps_W, std::vector<size_t>& ctrs,
       std::vector<double>& reprErrs) const;
@@ -504,15 +663,15 @@ private:
    * @param[out] hps_W matched landmarks (homogeneous) positions.
    * @param[out] ctrs Number of matches (by im).
    */
-  template<class CAMERA_GEOMETRY>
+  template<class CAMERA_GEOMETRY, class CANDIDATES>
   void matchToMapByThreadUnitialised(
       size_t threadIdx, size_t numThreads, const Estimator &estimator,
       const okvis::ViParameters& params, const uint64_t currentFrameId,
       const std::set<LandmarkId>* loopClosureLandmarksToUseExclusively,
       const kinematics::Transformation& T_WS1,
-      const AlignedMap<LandmarkId, LandmarkToMatch>& landmarksToMatch,
+      const CANDIDATES& landmarksToMatch,
       size_t numKeypoints,
-      const MapPoints& pointMap, size_t im, const MultiFramePtr&  multiFrame,
+      size_t im, const MultiFramePtr&  multiFrame,
       std::vector<double>& distances, std::vector<LandmarkId>& lmIds,
       AlignedVector<Eigen::Vector4d>& hps_W, std::vector<size_t>& ctrs) const;
 

@@ -23,6 +23,7 @@
 #include <sched.h>
 #include <sys/resource.h>
 #include <thread>
+#include <type_traits>
 
 #include <brisk/brisk.h>
 
@@ -57,7 +58,19 @@
 
 #include <okvis/Frontend.hpp>
 
+namespace {
+// getLandmark() deep-copies the landmark's observation set. Two hot call sites
+// (removeOutliers, the motion-stereo match insertion) only read position/quality
+// from it, so they go through an accessor that skips the copy.
+const bool lightLandmarkLookup = []() {
+  const char* e = std::getenv("OKVIS_LM_LIGHT");
+  return e == nullptr || std::atoi(e) != 0;  // OKVIS_LM_LIGHT=0 to disable
+}();
+}  // namespace
+
 #ifdef OKVIS_GPU_MATCHER
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <okvis/gpu_brisk_matcher.hpp>
 #endif
@@ -253,6 +266,18 @@ bool Frontend::detectAndDescribe(size_t cameraIndex, std::shared_ptr<okvis::Mult
 
   // detect
   frameOut->detect(cameraIndex);
+
+  // Optional keypoint census (OKVIS_KPT_CENSUS=1). max_num_keypoints is a hard
+  // clip applied after score sorting, so it only bites when the detector finds
+  // more candidates than the budget. Logging the actual count is the only way to
+  // tell whether the budget or the scene texture is the binding constraint.
+  static const bool kptCensus = []() {
+    const char* e = std::getenv("OKVIS_KPT_CENSUS");
+    return e && e[0] == '1';
+  }();
+  if (kptCensus) {
+    LOG(INFO) << "KPTCENSUS cam" << cameraIndex << " " << frameOut->numKeypoints(cameraIndex);
+  }
 
   // extract
   frameOut->describe(cameraIndex);
@@ -731,7 +756,9 @@ bool Frontend::dataAssociationAndInitialization(
     matchMapTimer.stop();
 
     // check tracking quality
+    TimerSwitchable tTrackQual1("2.06 trackingQuality (after matchToMap)");
     trackingQuality = estimator.trackingQuality(StateId(framesInOut->id()));
+    tTrackQual1.stop();
     if (trackingQuality < 0.01) {
       if(estimator.numFrames() == 2 && params.nCameraSystem.numCameras()==1) {
         // mono. we can't have matches at this point, so don't warn
@@ -779,7 +806,9 @@ bool Frontend::dataAssociationAndInitialization(
           LOG(INFO) << "Initialized!";
         }
       }
+      TimerSwitchable tTrackQual2("2.06 trackingQuality (after motion stereo)");
       trackingQuality = estimator.trackingQuality(StateId(framesInOut->id()));
+      tTrackQual2.stop();
       matchMotionStereoTimer.stop();
     }
     //OKVIS_ASSERT_TRUE(Exception, estimator.areLandmarksInFrontOfCameras(), "after match motion stereo")
@@ -789,13 +818,16 @@ bool Frontend::dataAssociationAndInitialization(
       *asKeyframe = true;
      }
     else{
+      TimerSwitchable tKfDecision("2.05 doWeNeedANewKeyframe");
       *asKeyframe = doWeNeedANewKeyframe(estimator, framesInOut);
+      tKfDecision.stop();
     }
   } else {
     *asKeyframe = true;  // first frame needs to be keyframe
   }
 
   // prepare features for place recognition
+  TimerSwitchable tPrFeatures("2.04 build place-recognition features");
   std::vector<std::vector<uchar>> features(framesInOut->numKeypoints());
   // first, we are trying to match the database for loop closures
   int offset = 0;
@@ -808,6 +840,7 @@ bool Frontend::dataAssociationAndInitialization(
     }
     offset += framesInOut->numKeypoints(im);
   }
+  tPrFeatures.stop();
 
   /*MULTI-SESSION AND MULTI-AGENT*/
   if (!estimator.isLoopClosing() && !estimator.isLoopClosureAvailable()
@@ -1045,19 +1078,22 @@ bool Frontend::dataAssociationAndInitialization(
   }
 
   // remove outliers, as the last matching step may have introduced some:
+  int inliers1 = 0;
+  {
+  TimerSwitchable tRemoveOutliers1("2.11 removeOutliers (#1 of 2)");
   switch (distortionType) {
   case okvis::cameras::NCameraSystem::RadialTangential: {
-    removeOutliers<cameras::PinholeCamera<cameras::RadialTangentialDistortion>>(
+    inliers1 = removeOutliers<cameras::PinholeCamera<cameras::RadialTangentialDistortion>>(
       estimator, params.nCameraSystem, framesInOut);
     break;
   }
   case okvis::cameras::NCameraSystem::Equidistant: {
-    removeOutliers<cameras::PinholeCamera<cameras::EquidistantDistortion>>(
+    inliers1 = removeOutliers<cameras::PinholeCamera<cameras::EquidistantDistortion>>(
       estimator, params.nCameraSystem, framesInOut);
     break;
   }
   case okvis::cameras::NCameraSystem::RadialTangential8: {
-    removeOutliers<okvis::cameras::PinholeCamera<cameras::RadialTangentialDistortion8>>(
+    inliers1 = removeOutliers<okvis::cameras::PinholeCamera<cameras::RadialTangentialDistortion8>>(
       estimator, params.nCameraSystem, framesInOut);
     break;
   }
@@ -1065,22 +1101,32 @@ bool Frontend::dataAssociationAndInitialization(
     OKVIS_THROW(Exception, "Unsupported distortion type.")
     break;
   }
+  }
 
-
-  // remove outliers, as the last matching step may have introduced some:
+  // Repeat of the block above, verbatim. removeOutliers() is a pure function of
+  // (pose, landmark positions, keypoints), none of which the first call changes,
+  // so the second pass can only re-confirm the first one's verdict -- a counter
+  // over 1500 frames measured it removing 0 observations. Skipped by default.
+  static const int dupOutlierMode = []() {
+    const char* e = std::getenv("OKVIS_MTM_DUP_OUTLIERS");
+    return e ? std::atoi(e) : 1;   // OKVIS_MTM_DUP_OUTLIERS=0 to run it twice
+  }();
+  if (dupOutlierMode != 1) {
+  int inliers2 = 0;
+  TimerSwitchable tRemoveOutliers2("2.12 removeOutliers (#2 of 2, duplicate call)");
   switch (distortionType) {
   case okvis::cameras::NCameraSystem::RadialTangential: {
-    removeOutliers<cameras::PinholeCamera<cameras::RadialTangentialDistortion>>(
+    inliers2 = removeOutliers<cameras::PinholeCamera<cameras::RadialTangentialDistortion>>(
       estimator, params.nCameraSystem, framesInOut);
     break;
   }
   case okvis::cameras::NCameraSystem::Equidistant: {
-    removeOutliers<cameras::PinholeCamera<cameras::EquidistantDistortion>>(
+    inliers2 = removeOutliers<cameras::PinholeCamera<cameras::EquidistantDistortion>>(
       estimator, params.nCameraSystem, framesInOut);
     break;
   }
   case okvis::cameras::NCameraSystem::RadialTangential8: {
-    removeOutliers<okvis::cameras::PinholeCamera<cameras::RadialTangentialDistortion8>>(
+    inliers2 = removeOutliers<okvis::cameras::PinholeCamera<cameras::RadialTangentialDistortion8>>(
       estimator, params.nCameraSystem, framesInOut);
     break;
   }
@@ -1088,6 +1134,24 @@ bool Frontend::dataAssociationAndInitialization(
     OKVIS_THROW(Exception, "Unsupported distortion type.")
     break;
   } //ToDo:EUCM
+  // Both calls return the number of surviving observations; if the second one
+  // ever removed anything the counts would differ.
+  static const bool dupCensus = []() {
+    const char* e = std::getenv("OKVIS_MTM_CENSUS");
+    return e && e[0] == '1';
+  }();
+  static size_t dupFrames = 0, dupDiffering = 0, dupRemoved = 0;
+  ++dupFrames;
+  if (inliers2 != inliers1) {
+    ++dupDiffering;
+    dupRemoved += size_t(inliers1 - inliers2);
+  }
+  if (dupCensus && dupFrames % 500 == 0) {
+    LOG(INFO) << "[dup-outliers] frames=" << dupFrames << " frames where the 2nd call "
+              << "changed the inlier count=" << dupDiffering
+              << " observations it removed=" << dupRemoved;
+  }
+  }
 
 #ifdef OKVIS_USE_NN
   if(params.frontend.use_cnn) {
@@ -1132,7 +1196,9 @@ bool Frontend::dataAssociationAndInitialization(
     }
   }
 #endif
+  TimerSwitchable tCleanLm("2.13 cleanUnobservedLandmarks");
   estimator.cleanUnobservedLandmarks();
+  tCleanLm.stop();
 
   return trackingQuality >= 0.01;
 }
@@ -1300,13 +1366,82 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     return 0;
   }
 
-  // get all landmarks
-  MapPoints pointMap;
-  {
+  // Snapshot of all landmarks. The stock path rebuilds it from scratch every
+  // call, which allocates one map node per landmark plus two set nodes per
+  // observation (getLandmarks builds the observation set twice) and frees the
+  // lot again at the end -- measured 2.0 ms to build + 2.0 ms to free per frame.
+  // By default the snapshot is kept alive across frames and merge-walked against
+  // the graph instead, so only genuinely new entries allocate. The resulting
+  // container is element-wise identical either way; =2 asserts that every frame.
+  static const int lmSyncMode = []() {
+    const char* e = std::getenv("OKVIS_MTM_LMSYNC");
+    return e ? std::atoi(e) : 1;   // 0 = rebuild from scratch, 2 = sync + verify
+  }();
+  // Structure-of-arrays candidate preparation. The snapshot, the candidate table
+  // and the descriptor pool all stop being maps of per-entry heap blocks and
+  // become parallel arrays whose capacity only grows, which removes the ~14k
+  // allocations per frame that VIO_PROFILING.md 3.12 attributes to this stage.
+  // Nothing about the maths, the ordering or any decision changes.
+  //   0 (default) = stock containers, untouched
+  //   1 = the flat path replaces them
+  //   2 = self-check: build both on every frame, compare the candidate tables
+  //       field by field *and* the resulting match sets, and keep the stock
+  //       result. Same device as OKVIS_MTM_LMSYNC=2 and OKVIS_MATCH_GPU=2.
+  static const int soaMode = []() {
+    const char* e = std::getenv("OKVIS_SOA");
+    return e ? std::atoi(e) : 0;
+  }();
+  const bool soaAuthoritative = soaMode == 1;
+
+  MapPoints localPointMap;
+  MapPoints& pointMap = lmSyncMode != 0 ? cachedPointMap_ : localPointMap;
+  if (soaMode != 0) {
+    TimerSwitchable tGetLmSoa("2.01z2 getLandmarksSoA");
+    estimator.getLandmarksSoA(soaPointMap_);
+    tGetLmSoa.stop();
+    if (soaCandidates_.size() < params.nCameraSystem.numCameras()) {
+      soaCandidates_.resize(params.nCameraSystem.numCameras());
+    }
+  }
+  if (soaMode != 1) {
     TimerSwitchable tGetLm("2.01z getLandmarks");
-    estimator.getLandmarks(pointMap);
+    if (lmSyncMode != 0) {
+      estimator.syncLandmarks(pointMap);
+    } else {
+      estimator.getLandmarks(pointMap);
+    }
     tGetLm.stop();
   }
+  if (lmSyncMode == 2) {
+    // verification mode: the incremental snapshot must equal a fresh one
+    MapPoints reference;
+    estimator.getLandmarks(reference);
+    OKVIS_ASSERT_TRUE(Exception, reference.size() == pointMap.size(),
+                      "syncLandmarks: size " << pointMap.size() << " vs " << reference.size())
+    auto a = pointMap.begin();
+    for (auto b = reference.begin(); b != reference.end(); ++b, ++a) {
+      OKVIS_ASSERT_TRUE(Exception, a->first == b->first, "syncLandmarks: id mismatch")
+      OKVIS_ASSERT_TRUE(Exception, a->second.id == b->second.id, "syncLandmarks: stored id")
+      OKVIS_ASSERT_TRUE(Exception, a->second.point == b->second.point, "syncLandmarks: point")
+      OKVIS_ASSERT_TRUE(Exception, a->second.quality == b->second.quality, "syncLandmarks: quality")
+      OKVIS_ASSERT_TRUE(Exception, a->second.isInitialised == b->second.isInitialised,
+                        "syncLandmarks: isInitialised")
+      OKVIS_ASSERT_TRUE(Exception, a->second.classification == b->second.classification,
+                        "syncLandmarks: classification")
+      OKVIS_ASSERT_TRUE(Exception, a->second.observations == b->second.observations,
+                        "syncLandmarks: observations")
+    }
+  }
+
+  // OKVIS_MTM_CENSUS=1 reports how much of the copied-out map the build loop
+  // actually consumes, i.e. how much of getLandmarks' cost is spent on landmarks
+  // that the FoV check discards before ever touching their observations.
+  static const bool census = []() {
+    const char* e = std::getenv("OKVIS_MTM_CENSUS");
+    return e && e[0] == '1';
+  }();
+  static size_t censusCalls = 0, censusLm = 0, censusObsCopied = 0;
+  static size_t censusFov = 0, censusObsVisited = 0;
 
   // these may be needed for loop-closure map fusion
   std::vector<LandmarkId> oldIds, newIds;
@@ -1320,6 +1455,24 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   std::vector<cv::Mat> descriptorPool(params.nCameraSystem.numCameras());
   kinematics::Transformation T_WS1 = estimator.pose(StateId(currentFrameId));
   double reprErr = 0.0;
+#ifdef OKVIS_GPU_MATCHER
+  // GPU brute-force Hamming match-to-map (Thor iGPU, zero-copy), replacing the
+  // threaded CPU matcher for the main (non-loop-closure) path. Opt-in only:
+  // matching is NOT a VIO bottleneck -- 2.01b is 1.12 ms out of a ~92 ms frame.
+  //   0 (default) = the original CPU matcher, untouched
+  //   1 = the GPU kernel replaces it
+  //   2 = self-check: run both on every frame, compare the match set, the
+  //       distances, the reprErr contribution and the resulting RANSAC
+  //       decision, and keep the CPU result. Same device as OKVIS_MTM_LMSYNC=2.
+  static const int gpuMode = []() {
+    const char* e = std::getenv("OKVIS_MATCH_GPU");
+    return e ? std::atoi(e) : 0;
+  }();
+  // Shadow of reprErr built from the GPU's own numbers, so that mode 2 can
+  // compare the *decision* (numInitIter, runRansac) and not just the matches.
+  double reprErrGpu = 0.0;
+  size_t gpuCamerasChecked = 0;
+#endif
   for (size_t im = 0; im < params.nCameraSystem.numCameras(); ++im) {
 
     // the current frame to match
@@ -1348,10 +1501,56 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
         multiFrame->geometryAs<CAMERA_GEOMETRY>(im)->focalLengthU()
         + multiFrame->geometryAs<CAMERA_GEOMETRY>(im)->focalLengthV();
 
+    // T_WC of an observing frame depends only on (frameId, cameraIndex), of which
+    // there are ~2*numFrames distinct values, yet the loop below rebuilds it for
+    // every single observation of every landmark (~10^4 per camera pass). Poses
+    // cannot change inside this loop -- the next optimise() call is after it --
+    // so a per-pass cache is exact. OKVIS_MTM_POSECACHE=0 restores the recompute.
+    static const int poseCacheMode = []() {
+      const char* e = std::getenv("OKVIS_MTM_POSECACHE");
+      return e ? std::atoi(e) : 1;   // 0 = recompute for every observation
+    }();
+    std::vector<std::pair<uint64_t, kinematics::Transformation>> T_WC_cache;
+    T_WC_cache.reserve(32);
+    auto cachedT_WC = [&](const KeypointIdentifier& kid)
+        -> const kinematics::Transformation& {
+      const uint64_t key = (kid.frameId << 3) | uint64_t(kid.cameraIndex);
+      for (auto& e : T_WC_cache) {
+        if (e.first == key) return e.second;
+      }
+      T_WC_cache.emplace_back(key, estimator.pose(StateId(kid.frameId))
+                                       * (*multiFrame->T_SC(kid.cameraIndex)));
+      return T_WC_cache.back().second;
+    };
+
     // go through all landmarks
     const size_t numDescriptorsToKeep = 3; // use only best 3
+    if (soaMode != 0) {
+      TimerSwitchable tBuildSoa("2.01a2 build candidates (SoA)");
+      buildCandidatesSoA<CAMERA_GEOMETRY>(
+          estimator, multiFrame, im, loopClosureLandmarksToUseExclusively,
+          T_WC1, T_CW1, reprThreshold, maxU, maxV, focalLength,
+          soaCandidates_[im]);
+      tBuildSoa.stop();
+    }
+    // In mode 1 the stock containers below are never built, so the pool is never
+    // allocated and the map never gets a node.
+    if (soaMode != 1) {
+    TimerSwitchable tAllocPool("2.01y alloc descriptorPool");
     descriptorPool[im] = cv::Mat(
         int(numDescriptorsToKeep)*pointMap.size(), 48, CV_8UC1);
+    tAllocPool.stop();
+    if (soaMode == 2) {
+      // Comparison mode only, and the one thing mode 2 changes about the stock
+      // path. A candidate whose every observation is rejected still gets one
+      // descriptor row published (see the crop below), and that row is
+      // never written -- so stock feeds uninitialised heap bytes to the Hamming
+      // loop. There is no value the flat path could copy to match that, which
+      // would leave a handful of differences per replay permanently
+      // unexplainable. Defining the byte makes both paths comparable exactly;
+      // the frequency of the path is reported alongside the result.
+      descriptorPool[im].setTo(0);
+    }
     uchar* dataPtr = descriptorPool[im].data;
     TimerSwitchable tBuild("2.01a build landmarksToMatch");
     for(MapPoints::const_iterator it = pointMap.begin(); it != pointMap.end(); ++it) {
@@ -1389,6 +1588,11 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
       if (kp[1] > maxV)
         continue;
 
+      if (census) {
+        ++censusFov;
+        censusObsVisited += it->second.observations.size();
+      }
+
       landmarkToMatch.projection = kp;
 
       // distinguish whether to consider as 3D point or not.
@@ -1400,6 +1604,13 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
           int(numDescriptorsToKeep), 48, CV_8UC1, dataPtr);
       landmarkToMatch.e_W.resize(3,numDescriptorsToKeep);
       landmarkToMatch.r_W.resize(3,numDescriptorsToKeep);
+      if (soaMode == 2) {
+        // Same reason as zeroing the pool: Eigen's resize does not initialise,
+        // and the all-rejected case publishes column 0 regardless. Defining it
+        // in comparison mode only.
+        landmarkToMatch.e_W.setZero();
+        landmarkToMatch.r_W.setZero();
+      }
       landmarkToMatch.kids.reserve(numDescriptorsToKeep);
       const LandmarkId landmarkId = it->first;
       size_t o=0;
@@ -1410,12 +1621,17 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
         const KeypointIdentifier kid = *obsiter;
 
         // remove some descriptors that are unlikely to match
-        const kinematics::Transformation T_SC_old =
-            *multiFrame->T_SC(kid.cameraIndex);
-        const kinematics::Transformation T_WS_old =
-            estimator.pose(StateId(kid.frameId));
-        const kinematics::Transformation T_WC_old = T_WS_old * T_SC_old;
-        const Eigen::Vector3d r_W_old = hp_W.head<3>()/hp_W[3] - T_WC_old.r();
+        kinematics::Transformation T_WC_old_recomputed;
+        if (poseCacheMode == 0) {
+          const kinematics::Transformation T_SC_old =
+              *multiFrame->T_SC(kid.cameraIndex);
+          const kinematics::Transformation T_WS_old =
+              estimator.pose(StateId(kid.frameId));
+          T_WC_old_recomputed = T_WS_old * T_SC_old;
+        }
+        const kinematics::Transformation& T_WC_old =
+            poseCacheMode == 0 ? T_WC_old_recomputed : cachedT_WC(kid);
+        const Eigen::Vector3d r_W_old = landmarkToMatch.p_W - T_WC_old.r();
 
         // check if 3D
         if(!landmarkToMatch.is3d) {
@@ -1493,7 +1709,69 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
       landmarksToMatch[landmarkId] = landmarkToMatch;
     }
     tBuild.stop();
+    TimerSwitchable tCopyLmVec("2.01x copy landmarksToMatchVec");
     landmarksToMatchVec[im] = landmarksToMatch;
+    tCopyLmVec.stop();
+    }  // if (soaMode != 1)
+
+    // Self-check: both tables were built from the same graph state on this exact
+    // frame, so compare them entry by entry and field by field. Ordering is part
+    // of the contract (see risk R3), hence the positional comparison.
+    if (soaMode == 2) {
+      const LandmarkMatchSoA& soa = soaCandidates_[im];
+      static size_t chkPasses = 0, chkEntries = 0, chkCountMismatch = 0,
+                    chkIdMismatch = 0, chkProjMismatch = 0, chkIs3dMismatch = 0,
+                    chkIgnoreMismatch = 0, chkRowsMismatch = 0,
+                    chkDescMismatch = 0, chkEwMismatch = 0, chkRwMismatch = 0,
+                    chkEmptyDesc = 0;
+      ++chkPasses;
+      if (soa.size() != landmarksToMatch.size()) ++chkCountMismatch;
+      size_t i = 0;
+      for (auto it = landmarksToMatch.begin();
+           it != landmarksToMatch.end() && i < soa.size(); ++it, ++i) {
+        ++chkEntries;
+        if (soa.id[i] != it->first.value()) { ++chkIdMismatch; continue; }
+        if (soa.projXY[2 * i] != it->second.projection[0]
+            || soa.projXY[2 * i + 1] != it->second.projection[1]) ++chkProjMismatch;
+        if ((soa.is3d[i] != 0) != it->second.is3d) ++chkIs3dMismatch;
+        if ((soa.ignore[i] != 0) != it->second.ignore) ++chkIgnoreMismatch;
+        const int rows = it->second.descriptors.rows;
+        // Counted, and also compared: with the stock pool zeroed in this mode the
+        // all-rejected row is zeros on both sides, so it is held to the same
+        // byte-for-byte standard as every other row.
+        if (it->second.kids.empty()) ++chkEmptyDesc;
+        if (soa.descRows[i] != rows) { ++chkRowsMismatch; continue; }
+        const uint8_t* soaDesc =
+            &soa.desc[size_t(soa.descRow[i]) * kDescriptorBytes];
+        if (std::memcmp(soaDesc, it->second.descriptors.data,
+                        size_t(rows) * kDescriptorBytes) != 0) ++chkDescMismatch;
+        for (int d = 0; d < rows; ++d) {
+          for (int c = 0; c < 3; ++c) {
+            if (soa.eW[i * 3 * kNumDescriptorsToKeep + 3 * size_t(d) + size_t(c)]
+                != it->second.e_W(c, d)) { ++chkEwMismatch; break; }
+          }
+          for (int c = 0; c < 3; ++c) {
+            if (soa.rW[i * 3 * kNumDescriptorsToKeep + 3 * size_t(d) + size_t(c)]
+                != it->second.r_W(c, d)) { ++chkRwMismatch; break; }
+          }
+        }
+      }
+      if (chkPasses % 500 == 0) {
+        LOG(INFO) << "[soa-check] passes=" << chkPasses
+                  << " candidates=" << chkEntries
+                  << " mismatches: count=" << chkCountMismatch
+                  << " id=" << chkIdMismatch
+                  << " projection=" << chkProjMismatch
+                  << " is3d=" << chkIs3dMismatch
+                  << " ignore=" << chkIgnoreMismatch
+                  << " descRows=" << chkRowsMismatch
+                  << " descriptors=" << chkDescMismatch
+                  << " e_W=" << chkEwMismatch
+                  << " r_W=" << chkRwMismatch
+                  << " | of which all-observations-rejected (stock pool zeroed in"
+                     " this mode so the row is comparable)=" << chkEmptyDesc;
+      }
+    }
 
     // multithreaded matching
     const size_t num_matching_threads = size_t(params.frontend.num_matching_threads);
@@ -1507,114 +1785,247 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     TimerSwitchable tMatch3d("2.01b match threads (3d)");
     bool matchedOnGpu = false;
 #ifdef OKVIS_GPU_MATCHER
-    // GPU brute-force Hamming match-to-map (Thor iGPU, zero-copy). Only the main
-    // (non-loop-closure) path; loop closure keeps the CPU route. Falls back to
-    // CPU on any failure. distances/lmIds are only written on success, so the
-    // fallback below still sees pristine initial values.
-    {
-      // Opt-in only: matching is NOT a VIO bottleneck (GPU kernel ~0.12ms, but the
-      // match-to-map stage is dominated by BA + landmark preprocessing). Default
-      // to the original CPU matcher; set OKVIS_MATCH_GPU=1 to enable the GPU path.
-      static const bool gpuEnabled = []() {
-        const char* e = std::getenv("OKVIS_MATCH_GPU");
-        return e && e[0] == '1';
-      }();
-      if (gpuEnabled && !loopClosureLandmarksToUseExclusively
-          && gpu::gpuMatcherAvailable()) {
-        // flatten candidate landmarks in ascending-LandmarkId (std::map) order
-        const uint8_t* poolBase = descriptorPool[im].data;
-        std::vector<float> lmProjXY;
-        std::vector<int> lmDescOffRow, lmDescRows;
-        std::vector<LandmarkId> lmIdOf;
-        lmProjXY.reserve(2 * landmarksToMatch.size());
-        lmDescOffRow.reserve(landmarksToMatch.size());
-        lmDescRows.reserve(landmarksToMatch.size());
-        lmIdOf.reserve(landmarksToMatch.size());
-        for (auto it = landmarksToMatch.begin(); it != landmarksToMatch.end(); ++it) {
-          if (!it->second.is3d) continue;  // same gate as the CPU thread
-          const cv::Mat& dsc = it->second.descriptors;
-          if (dsc.rows == 0) continue;
-          lmProjXY.push_back(float(it->second.projection[0]));
-          lmProjXY.push_back(float(it->second.projection[1]));
-          lmDescOffRow.push_back(int((dsc.data - poolBase) / 48));
-          lmDescRows.push_back(int(dsc.rows));
-          lmIdOf.push_back(it->first);
+    // Only the main (non-loop-closure) path; loop closure keeps the CPU route.
+    // Falls back to CPU on any failure: distances/lmIds are only written once
+    // the kernel has succeeded, so the fallback still sees pristine values.
+    std::vector<double> shadowDistances;    // mode 2 only
+    std::vector<LandmarkId> shadowLmIds;    // mode 2 only
+    double gpuReprErrContrib = 0.0;
+    bool gpuMatched = false;                // kernel ran and produced a result
+    // The GPU path reads the stock cv::Mat descriptor pool, which OKVIS_SOA=1
+    // does not build; the two switches are not meant to be combined, and Phase 0
+    // already judged the GPU matcher a net loss (VIO_PROFILING.md 3.13).
+    if (gpuMode != 0 && soaMode == 0 && !loopClosureLandmarksToUseExclusively
+        && gpu::gpuMatcherAvailable()) {
+      // Reused across calls (capacity only grows): what this experiment has to
+      // price is the irreducible cost of marshalling the frontend's pointer-
+      // chasing containers into flat arrays, not the allocator on top of it.
+      thread_local std::vector<double> lmProjXY;
+      thread_local std::vector<int> lmDescOffRow, lmDescRows;
+      thread_local std::vector<LandmarkId> lmIdOf;
+      thread_local std::vector<double> curKpXY;
+      thread_local std::vector<uint8_t> useKp;
+      thread_local std::vector<int> bestLmIdx, reprCnt;
+      thread_local std::vector<double> bestHam, reprSum;
+
+      // flatten candidate landmarks in ascending-LandmarkId (std::map) order
+      TimerSwitchable tFlatLm("2.01b3 gpu flatten landmarks (3d)");
+      const uint8_t* poolBase = descriptorPool[im].data;
+      lmProjXY.clear();
+      lmDescOffRow.clear();
+      lmDescRows.clear();
+      lmIdOf.clear();
+      for (auto it = landmarksToMatch.begin(); it != landmarksToMatch.end(); ++it) {
+        if (!it->second.is3d) continue;  // same gate as the CPU thread
+        const cv::Mat& dsc = it->second.descriptors;
+        if (dsc.rows == 0) continue;
+        lmProjXY.push_back(it->second.projection[0]);
+        lmProjXY.push_back(it->second.projection[1]);
+        lmDescOffRow.push_back(int((dsc.data - poolBase) / 48));
+        lmDescRows.push_back(int(dsc.rows));
+        lmIdOf.push_back(it->first);
+      }
+      const int Mg = int(lmIdOf.size());
+      tFlatLm.stop();
+
+      if (Mg == 0) {
+        matchedOnGpu = gpuMode == 1;  // nothing to match, but the stage is complete
+      } else {
+        TimerSwitchable tFlatKp("2.01b4 gpu flatten keypoints (3d)");
+        const uint8_t* curDesc = multiFrame->keypointDescriptor(im, 0);
+        curKpXY.resize(2 * numKeypoints);
+        useKp.assign(numKeypoints, 1);
+        for (size_t k = 0; k < numKeypoints; ++k) {
+          Eigen::Vector2d kp;
+          multiFrame->getKeypoint(im, k, kp);
+          curKpXY[2 * k + 0] = kp[0];
+          curKpXY[2 * k + 1] = kp[1];
+          if (multiFrame->landmarkId(im, k)) useKp[k] = 0;  // already matched
         }
-        const int Mg = int(lmIdOf.size());
-        if (Mg == 0) {
-          matchedOnGpu = true;  // nothing to match, but the stage is complete
-        } else {
-          const uint8_t* curDesc = multiFrame->keypointDescriptor(im, 0);
-          std::vector<float> curKpXY(2 * numKeypoints);
-          std::vector<uint8_t> useKp(numKeypoints, 1);
+        bestLmIdx.assign(numKeypoints, -1);
+        bestHam.assign(numKeypoints, briskMatchingThreshold_);
+        reprSum.assign(numKeypoints, 0.0);
+        reprCnt.assign(numKeypoints, 0);
+
+        gpu::GpuMatchInput gin;
+        gin.curDesc = curDesc;
+        gin.curKpXY = curKpXY.data();
+        gin.useKp = useKp.data();
+        gin.numKeypoints = int(numKeypoints);
+        gin.lmProjXY = lmProjXY.data();
+        gin.poolBase = poolBase;
+        gin.lmDescOffRow = lmDescOffRow.data();
+        gin.lmDescRows = lmDescRows.data();
+        gin.numLandmarks = Mg;
+        gin.reprThreshSq = reprThreshold * reprThreshold;
+        gin.matchThresh = briskMatchingThreshold_;
+        tFlatKp.stop();
+
+        double kernelMs = 0.0;
+        TimerSwitchable tKernel("2.01b5 gpu kernel + sync (3d)");
+        const bool gpuOk = gpu::matchToMapGPU(gin, bestLmIdx.data(), bestHam.data(),
+                                              reprSum.data(), reprCnt.data(),
+                                              &kernelMs);
+        tKernel.stop();
+        if (gpuOk) {
+          TimerSwitchable tScatter("2.01b6 gpu scatter results (3d)");
+          if (gpuMode == 2) {
+            shadowDistances = distances;
+            shadowLmIds = lmIds;
+          }
+          std::vector<double>& outDist = gpuMode == 2 ? shadowDistances : distances;
+          std::vector<LandmarkId>& outIds = gpuMode == 2 ? shadowLmIds : lmIds;
           for (size_t k = 0; k < numKeypoints; ++k) {
-            Eigen::Vector2d kp;
-            multiFrame->getKeypoint(im, k, kp);
-            curKpXY[2 * k + 0] = float(kp[0]);
-            curKpXY[2 * k + 1] = float(kp[1]);
-            if (multiFrame->landmarkId(im, k)) useKp[k] = 0;  // already matched
-          }
-          std::vector<int> bestLmIdx(numKeypoints, -1);
-          std::vector<float> bestHam(numKeypoints, float(briskMatchingThreshold_));
-          std::vector<float> bestRepr(numKeypoints, 0.f);
-
-          gpu::GpuMatchInput gin;
-          gin.curDesc = curDesc;
-          gin.curKpXY = curKpXY.data();
-          gin.useKp = useKp.data();
-          gin.numKeypoints = int(numKeypoints);
-          gin.lmProjXY = lmProjXY.data();
-          gin.poolBase = poolBase;
-          gin.lmDescOffRow = lmDescOffRow.data();
-          gin.lmDescRows = lmDescRows.data();
-          gin.numLandmarks = Mg;
-          gin.reprThreshSq = float(reprThreshold * reprThreshold);
-          gin.matchThresh = float(briskMatchingThreshold_);
-
-          if (gpu::matchToMapGPU(gin, bestLmIdx.data(), bestHam.data(),
-                                 bestRepr.data())) {
-            double reprSum = 0.0;
-            size_t nMatched = 0;
-            for (size_t k = 0; k < numKeypoints; ++k) {
-              if (bestLmIdx[k] >= 0) {
-                distances[k] = bestHam[k];
-                lmIds[k] = lmIdOf[size_t(bestLmIdx[k])];
-                reprSum += bestRepr[k];
-                ++nMatched;
-              }
+            if (bestLmIdx[k] >= 0) {
+              outDist[k] = bestHam[k];
+              outIds[k] = lmIdOf[size_t(bestLmIdx[k])];
             }
-            // The CPU accumulates sum_t(per-thread mean reproj); a single global
-            // mean scaled by the thread count is the natural equivalent (this
-            // only feeds the RANSAC trigger, not the matches themselves).
-            if (nMatched > 0) {
-              reprErr += (reprSum / double(nMatched)) * double(num_matching_threads);
-            }
-            matchedOnGpu = true;
           }
+          // Rebuild reprErr exactly as the CPU produces it. The CPU splits the
+          // keypoints into num_matching_threads contiguous segments, and each
+          // thread averages one term *per improvement of its running best*
+          // (not one term per matched keypoint) over its own segment; the caller
+          // then sums those per-thread means. reprErr decides numInitIter and
+          // whether RANSAC runs, so any other formula changes the estimator
+          // instead of accelerating it -- see risk R2. Dividing by a zero count
+          // yields NaN here just as it does on the CPU; that is deliberate.
+          const size_t segment = numKeypoints / num_matching_threads;
+          for (size_t t = 0; t < num_matching_threads; ++t) {
+            const size_t startK = segment * t;
+            const size_t endK =
+                t + 1 == num_matching_threads ? numKeypoints : startK + segment;
+            double segSum = 0.0;
+            size_t segCtr = 0;
+            for (size_t k = startK; k < endK; ++k) {
+              segSum += reprSum[k];
+              segCtr += size_t(reprCnt[k]);
+            }
+            gpuReprErrContrib += segSum / double(segCtr);
+          }
+          tScatter.stop();
+          gpuMatched = true;
+          matchedOnGpu = gpuMode == 1;
         }
       }
+    }
+    if (matchedOnGpu) {
+      reprErr += gpuReprErrContrib;
     }
 #endif  // OKVIS_GPU_MATCHER
 
-    if (!matchedOnGpu) {
+    // One body, either candidate layout: the matcher's tie-breaking and its
+    // reprErr accumulation are what decide the estimator's control flow, so they
+    // exist exactly once rather than once per layout.
+    auto runMatch3d = [&](const auto& view, std::vector<double>& dist,
+                          std::vector<LandmarkId>& ids,
+                          AlignedVector<Eigen::Vector4d>& hps,
+                          std::vector<size_t>& cts,
+                          std::vector<double>& errs) {
+      using View = std::decay_t<decltype(view)>;
       std::vector<std::thread*> threads(num_matching_threads, nullptr);
+      // Spawn timed separately from join: spawn is pure thread-creation cost,
+      // join is creation + the matching work itself. The gap between them says
+      // whether replacing this per-frame churn with a pool is worth anything.
+      TimerSwitchable tSpawn("2.01b1 spawn match threads (3d)");
       for(size_t t = 0; t<num_matching_threads; ++t) {
         threads[t] = new std::thread(
-            &Frontend::matchToMapByThread<CAMERA_GEOMETRY>, this, t, num_matching_threads,
+            &Frontend::matchToMapByThread<CAMERA_GEOMETRY, View>, this, t,
+                num_matching_threads,
                 std::cref(estimator), std::cref(params), currentFrameId,
                 loopClosureLandmarksToUseExclusively, std::cref(T_WS1),
-                std::cref(landmarksToMatch), numKeypoints,
-                std::cref(pointMap), im, std::cref(multiFrame), std::ref(distances),
-                std::ref(lmIds), std::ref(hps_W), std::ref(ctrs), std::ref(reprErrors));
+                std::cref(view), numKeypoints,
+                im, std::cref(multiFrame), std::ref(dist),
+                std::ref(ids), std::ref(hps), std::ref(cts), std::ref(errs));
       }
+      tSpawn.stop();
 
+      TimerSwitchable tJoin("2.01b2 join match threads (3d)");
+      double contrib = 0.0;
       for(size_t t = 0; t<num_matching_threads; ++t) {
         threads[t]->join();
         delete threads[t];
-        reprErr += reprErrors[t];
+        contrib += errs[t];
       }
+      tJoin.stop();
+      return contrib;
+    };
+
+    double cpuReprErrContrib = 0.0;
+    const CandidateSoaView soaView{
+        soaMode != 0 ? &soaCandidates_[im] : nullptr};
+    if (!matchedOnGpu) {
+      if (soaAuthoritative) {
+        cpuReprErrContrib =
+            runMatch3d(soaView, distances, lmIds, hps_W, ctrs, reprErrors);
+      } else {
+        const CandidateMapView mapView{&landmarksToMatch};
+        cpuReprErrContrib =
+            runMatch3d(mapView, distances, lmIds, hps_W, ctrs, reprErrors);
+      }
+      reprErr += cpuReprErrContrib;
     }
     tMatch3d.stop();
+
+    // Self-check: match the same keypoints against the flat table as well and
+    // compare the outcome the estimator actually consumes -- the match set, the
+    // distances and the reprErr contribution that selects numInitIter/RANSAC.
+    if (soaMode == 2 && !matchedOnGpu) {
+      std::vector<double> soaDistances(numKeypoints, briskMatchingThreshold_);
+      std::vector<LandmarkId> soaLmIds(numKeypoints);
+      AlignedVector<Eigen::Vector4d> soaHps(numKeypoints, Eigen::Vector4d::Zero());
+      std::vector<size_t> soaCtrs(num_matching_threads);
+      std::vector<double> soaErrs(num_matching_threads);
+      const double soaContrib =
+          runMatch3d(soaView, soaDistances, soaLmIds, soaHps, soaCtrs, soaErrs);
+      static size_t mPasses = 0, mKeypoints = 0, mIdMismatch = 0,
+                    mDistMismatch = 0;
+      static double mMaxReprErrDiff = 0.0;
+      ++mPasses;
+      for (size_t k = 0; k < numKeypoints; ++k) {
+        ++mKeypoints;
+        if (soaLmIds[k].value() != lmIds[k].value()) ++mIdMismatch;
+        if (soaDistances[k] != distances[k]) ++mDistMismatch;
+      }
+      mMaxReprErrDiff =
+          std::max(mMaxReprErrDiff, std::fabs(soaContrib - cpuReprErrContrib));
+      if (mPasses % 500 == 0) {
+        LOG(INFO) << "[soa-check] match(3d) passes=" << mPasses
+                  << " keypoints=" << mKeypoints
+                  << " landmarkId mismatches=" << mIdMismatch
+                  << " distance mismatches=" << mDistMismatch
+                  << " max |reprErr_soa - reprErr_stock| per pass="
+                  << mMaxReprErrDiff;
+      }
+    }
+
+#ifdef OKVIS_GPU_MATCHER
+    // Self-check: the GPU ran alongside the (authoritative) CPU matcher, so both
+    // answers exist for this exact frame. Compare them element-wise the way
+    // OKVIS_MTM_LMSYNC=2 compares the landmark snapshot.
+    if (gpuMode == 2 && gpuMatched) {
+      static size_t chkPasses = 0, chkKeypoints = 0, chkIdMismatch = 0,
+                    chkDistMismatch = 0;
+      static double chkMaxReprErrDiff = 0.0;
+      ++chkPasses;
+      for (size_t k = 0; k < numKeypoints; ++k) {
+        ++chkKeypoints;
+        if (shadowLmIds[k].value() != lmIds[k].value()) ++chkIdMismatch;
+        if (shadowDistances[k] != distances[k]) ++chkDistMismatch;
+      }
+      chkMaxReprErrDiff = std::max(
+          chkMaxReprErrDiff, std::fabs(gpuReprErrContrib - cpuReprErrContrib));
+      reprErrGpu += gpuReprErrContrib;
+      ++gpuCamerasChecked;
+      if (chkPasses % 500 == 0) {
+        LOG(INFO) << "[gpu-match-check] passes=" << chkPasses
+                  << " keypoints=" << chkKeypoints
+                  << " landmarkId mismatches=" << chkIdMismatch
+                  << " distance mismatches=" << chkDistMismatch
+                  << " max |reprErr_gpu - reprErr_cpu| per pass="
+                  << chkMaxReprErrDiff;
+      }
+    }
+#endif  // OKVIS_GPU_MATCHER
 
     // now insert observations
     TimerSwitchable tInsert3d("2.01c insert observations (3d)");
@@ -1630,9 +2041,27 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
         }
 
         multiFrame->setLandmarkId(im, k, lmIds[k].value());
+        // Timed per observation only under the census: TimerSwitchable resolves its
+        // tag through a std::string map on every construction, which is not free at
+        // ~750 calls per frame.
+        std::unique_ptr<TimerSwitchable> tAddObs(
+            census ? new TimerSwitchable("2.01c1 addObservation (3d, per observation)")
+                   : nullptr);
         estimator.addObservation<CAMERA_GEOMETRY>(
               lmIds[k], StateId(currentFrameId), im, k);
-        if (landmarksToMatch[lmIds[k]].ignore) {
+        tAddObs.reset();
+        // A landmark that is not a candidate cannot be matched, but note that the
+        // stock lookup is operator[], which *inserts* a default (ignore = false)
+        // entry on a miss -- so "not found" means "do not downweight", and the
+        // binary search reproduces that rather than the map's side effect.
+        bool ignoreLandmark = false;
+        if (soaAuthoritative) {
+          const int ci = soaCandidates_[im].find(lmIds[k].value());
+          ignoreLandmark = ci >= 0 && soaCandidates_[im].ignore[size_t(ci)] != 0;
+        } else {
+          ignoreLandmark = landmarksToMatch[lmIds[k]].ignore;
+        }
+        if (ignoreLandmark) {
           estimator.setObservationInformation(StateId(currentFrameId), im, k,
                                               Eigen::Matrix2d::Identity()*0.00001);
         }
@@ -1671,19 +2100,75 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     }
   }
 
+  // reprErr is not a diagnostic: it selects numInitIter and whether RANSAC runs.
+  // Any change to how the matcher computes it has to be judged here rather than
+  // on the wall clock, so publish the trigger rates every 500 frames.
+  {
+    static size_t decCalls = 0, decRansac = 0, decLargeReprErr = 0, decInitIter = 0;
+    static double decReprErrSum = 0.0;
+    ++decCalls;
+    if (runRansac) ++decRansac;
+    if (reprErr > strictReprThreshold) ++decLargeReprErr;
+    decInitIter += size_t(numInitIter);
+    decReprErrSum += reprErr;
+    if (decCalls % 500 == 0) {
+      LOG(INFO) << "[mtm-decision] calls=" << decCalls
+                << " runRansac=" << decRansac << " ("
+                << 100.0 * double(decRansac) / double(decCalls) << "%)"
+                << " largeReprErr=" << decLargeReprErr
+                << " meanNumInitIter=" << double(decInitIter) / double(decCalls)
+                << " meanReprErr=" << decReprErrSum / double(decCalls)
+                << " threshold=" << strictReprThreshold;
+    }
+  }
+#ifdef OKVIS_GPU_MATCHER
+  // Mode 2 also checks the decision the GPU's reprErr *would* have produced.
+  if (gpuMode == 2 && gpuCamerasChecked == params.nCameraSystem.numCameras()) {
+    reprErrGpu /= double(params.frontend.num_matching_threads
+                         * params.nCameraSystem.numCameras());
+    static size_t dcCalls = 0, dcRansacMismatch = 0;
+    static double dcMaxDiff = 0.0;
+    ++dcCalls;
+    if ((reprErrGpu > strictReprThreshold) != (reprErr > strictReprThreshold)) {
+      ++dcRansacMismatch;
+    }
+    dcMaxDiff = std::max(dcMaxDiff, std::fabs(reprErrGpu - reprErr));
+    if (dcCalls % 500 == 0) {
+      LOG(INFO) << "[gpu-match-check] frames=" << dcCalls
+                << " RANSAC-decision mismatches=" << dcRansacMismatch
+                << " max |reprErr_gpu - reprErr_cpu|=" << dcMaxDiff
+                << " (threshold " << strictReprThreshold << ")";
+    }
+  }
+#endif  // OKVIS_GPU_MATCHER
+
   // do optimisation
+  // This pose refinement costs 10.6 ms/frame -- the single largest item in the
+  // whole frame (see docs/VIO_PROFILING.md). OKVIS_MTM_OPT selects a variant so
+  // the accuracy cost of dropping it can be measured against the loop benchmark:
+  //   0 (default) = stock, both solves
+  //   1 = skip the second solve (the fixed 2-iteration one after outlier removal)
+  //   2 = skip the refinement entirely, giving the upper bound on the saving
+  static const int mtmOptMode = []() {
+    const char* e = std::getenv("OKVIS_MTM_OPT");
+    return e ? std::atoi(e) : 0;
+  }();
   std::vector<StateId> updatedStatesRealtime;
-  if(!loopClosureLandmarksToUseExclusively && ctr > 3) {
+  if(!loopClosureLandmarksToUseExclusively && ctr > 3 && mtmOptMode != 2) {
     TimerSwitchable tRtOpt("2.01o realtimeOptimise (inside matchToMap)");
     estimator.optimiseRealtimeGraph(
         numInitIter, updatedStatesRealtime, params.estimator.realtime_num_threads,
         false, true, isInitialized_);
+    TimerSwitchable tRemoveOutliers0("2.01p removeOutliers (between the two solves)");
     /*int numInliers = */removeOutliers<CAMERA_GEOMETRY>(estimator,
                                     params.nCameraSystem,
                                     estimator.multiFrame(StateId(currentFrameId)));
-    estimator.optimiseRealtimeGraph(
-      2, updatedStatesRealtime, params.estimator.realtime_num_threads,
-      false, true, isInitialized_);
+    tRemoveOutliers0.stop();
+    if (mtmOptMode != 1) {
+      estimator.optimiseRealtimeGraph(
+        2, updatedStatesRealtime, params.estimator.realtime_num_threads,
+        false, true, isInitialized_);
+    }
     T_WS1 = estimator.pose(StateId(currentFrameId));
     tRtOpt.stop();
   }
@@ -1714,23 +2199,66 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     AlignedVector<Eigen::Vector4d> hps_W(numKeypoints, Eigen::Vector4d::Zero());
     std::vector<size_t> ctrs(num_matching_threads);
 
-    TimerSwitchable tMatchUninit("2.01e match threads (uninitialised)");
-    std::vector<std::thread*> threads(num_matching_threads, nullptr);
-    for(size_t t = 0; t<num_matching_threads; ++t) {
-      threads[t] = new std::thread(
-          &Frontend::matchToMapByThreadUnitialised<CAMERA_GEOMETRY>, this, t, num_matching_threads,
-              std::cref(estimator), std::cref(params), currentFrameId,
-              loopClosureLandmarksToUseExclusively, std::cref(T_WS1),
-              std::cref(landmarksToMatchVec[im]), numKeypoints,
-              std::cref(pointMap), im, std::cref(multiFrame), std::ref(distances),
-              std::ref(lmIds), std::ref(hps_W), std::ref(ctrs));
-    }
+    auto runMatchUninit = [&](const auto& view, std::vector<double>& dist,
+                              std::vector<LandmarkId>& ids,
+                              AlignedVector<Eigen::Vector4d>& hps,
+                              std::vector<size_t>& cts) {
+      using View = std::decay_t<decltype(view)>;
+      std::vector<std::thread*> threads(num_matching_threads, nullptr);
+      for(size_t t = 0; t<num_matching_threads; ++t) {
+        threads[t] = new std::thread(
+            &Frontend::matchToMapByThreadUnitialised<CAMERA_GEOMETRY, View>, this,
+                t, num_matching_threads,
+                std::cref(estimator), std::cref(params), currentFrameId,
+                loopClosureLandmarksToUseExclusively, std::cref(T_WS1),
+                std::cref(view), numKeypoints,
+                im, std::cref(multiFrame), std::ref(dist),
+                std::ref(ids), std::ref(hps), std::ref(cts));
+      }
+      for(size_t t = 0; t<num_matching_threads; ++t) {
+        threads[t]->join();
+        delete threads[t];
+      }
+    };
 
-    for(size_t t = 0; t<num_matching_threads; ++t) {
-      threads[t]->join();
-      delete threads[t];
+    const CandidateSoaView soaView{
+        soaMode != 0 ? &soaCandidates_[im] : nullptr};
+    TimerSwitchable tMatchUninit("2.01e match threads (uninitialised)");
+    if (soaAuthoritative) {
+      runMatchUninit(soaView, distances, lmIds, hps_W, ctrs);
+    } else {
+      const CandidateMapView mapView{&landmarksToMatchVec[im]};
+      runMatchUninit(mapView, distances, lmIds, hps_W, ctrs);
     }
     tMatchUninit.stop();
+
+    if (soaMode == 2) {
+      std::vector<double> soaDistances(numKeypoints, briskMatchingThreshold_);
+      std::vector<LandmarkId> soaLmIds(numKeypoints);
+      AlignedVector<Eigen::Vector4d> soaHps(numKeypoints, Eigen::Vector4d::Zero());
+      std::vector<size_t> soaCtrs(num_matching_threads);
+      runMatchUninit(soaView, soaDistances, soaLmIds, soaHps, soaCtrs);
+      static size_t uPasses = 0, uKeypoints = 0, uIdMismatch = 0,
+                    uDistMismatch = 0, uHpMismatch = 0;
+      ++uPasses;
+      for (size_t k = 0; k < numKeypoints; ++k) {
+        ++uKeypoints;
+        if (soaLmIds[k].value() != lmIds[k].value()) ++uIdMismatch;
+        if (soaDistances[k] != distances[k]) ++uDistMismatch;
+        // hps_W is only overwritten on a non-parallel triangulation, so a
+        // non-winning candidate can leave its point behind. That makes this the
+        // strictest of the three: it compares the whole scan order, not just the
+        // winner.
+        if (soaHps[k] != hps_W[k]) ++uHpMismatch;
+      }
+      if (uPasses % 500 == 0) {
+        LOG(INFO) << "[soa-check] match(uninit) passes=" << uPasses
+                  << " keypoints=" << uKeypoints
+                  << " landmarkId mismatches=" << uIdMismatch
+                  << " distance mismatches=" << uDistMismatch
+                  << " triangulated-point mismatches=" << uHpMismatch;
+      }
+    }
 
     // Insert observations. Unlike the 3d pass this re-projects each candidate
     // into EVERY existing observation of its landmark to reject bad matches, so
@@ -1798,7 +2326,13 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
         multiFrame->setLandmarkId(im, k, lmIds[k].value());
         estimator.addObservation<CAMERA_GEOMETRY>(
             lmIds[k], StateId(currentFrameId), im, k);
-        if (landmarksToMatch[lmIds[k]].ignore) {
+        // `landmarksToMatch` here is the empty map declared at the top of this
+        // loop -- nothing ever fills it, the matcher is handed
+        // landmarksToMatchVec[im] instead. So operator[] default-constructs,
+        // .ignore is false and this branch is unreachable upstream; it also
+        // inserts a node per matched keypoint on the way. The flat path
+        // reproduces the outcome by not taking the branch at all.
+        if (!soaAuthoritative && landmarksToMatch[lmIds[k]].ignore) {
           estimator.setObservationInformation(StateId(currentFrameId), im, k,
                                               Eigen::Matrix2d::Identity()*0.00001);
         }
@@ -1830,18 +2364,220 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   }
   //OKVIS_ASSERT_TRUE(Exception, estimator.areLandmarksInFrontOfCameras(), "after match to map")
 
+  // These would be destroyed by going out of scope anyway; freeing them here
+  // just moves that cost inside a timer instead of leaving it unattributed.
+  if (census) {
+    ++censusCalls;
+    censusLm += pointMap.size();
+    for (const auto& lm : pointMap) censusObsCopied += lm.second.observations.size();
+    if (censusCalls % 500 == 0) {
+      LOG(INFO) << "[mtm-census] calls=" << censusCalls
+                << " landmarks/call=" << double(censusLm) / double(censusCalls)
+                << " observations copied/call=" << double(censusObsCopied) / double(censusCalls)
+                << " | per camera pass: FoV-passing landmarks="
+                << double(censusFov) / double(2 * censusCalls)
+                << " observations visited=" << double(censusObsVisited) / double(2 * censusCalls);
+    }
+  }
+
+  TimerSwitchable tTeardown("2.01v free pointMap + landmarksToMatchVec + pool");
+  landmarksToMatchVec.clear();
+  descriptorPool.clear();
+  localPointMap.clear();  // the OKVIS_MTM_LMSYNC snapshot is deliberately kept
+  tTeardown.stop();
+
   return ctr;
 }
 
-// Match a new multiframe to existing keyframes:
 template <class CAMERA_GEOMETRY>
+void Frontend::buildCandidatesSoA(
+    const Estimator& estimator, const MultiFramePtr& multiFrame, size_t im,
+    const std::set<LandmarkId>* loopClosureLandmarksToUseExclusively,
+    const kinematics::Transformation& T_WC1,
+    const kinematics::Transformation& T_CW1,
+    double reprThreshold, double maxU, double maxV, double focalLength,
+    LandmarkMatchSoA& out) const {
+
+  constexpr int D = kNumDescriptorsToKeep;
+  constexpr int B = kDescriptorBytes;
+  const size_t numLandmarks = soaPointMap_.size();
+
+  out.clear();
+  out.id.reserve(numLandmarks);
+  out.projXY.reserve(2 * numLandmarks);
+  out.descRow.reserve(numLandmarks);
+  out.descRows.reserve(numLandmarks);
+  out.is3d.reserve(numLandmarks);
+  out.ignore.reserve(numLandmarks);
+  out.eW.reserve(3 * size_t(D) * numLandmarks);
+  out.rW.reserve(3 * size_t(D) * numLandmarks);
+  // Same worst case as the stock cv::Mat pool: D rows per landmark. resize()
+  // keeps whatever capacity earlier frames grew to, so this does not allocate
+  // once the map has reached its steady size.
+  out.desc.resize(size_t(D) * B * numLandmarks);
+
+  const std::shared_ptr<const CAMERA_GEOMETRY> geometry =
+      multiFrame->geometryAs<CAMERA_GEOMETRY>(im);
+
+  // T_WC of an observing frame depends only on (frameId, cameraIndex) and cannot
+  // change inside this loop, and the same handful of multiframes is revisited
+  // for every landmark, so both are looked up once per distinct key.
+  std::vector<std::pair<uint64_t, kinematics::Transformation>> T_WC_cache;
+  std::vector<std::pair<uint64_t, MultiFramePtr>> frameCache;
+  T_WC_cache.reserve(32);
+  frameCache.reserve(16);
+  auto cachedFrame = [&](uint64_t frameId) -> const MultiFrame* {
+    for (auto& e : frameCache) {
+      if (e.first == frameId) return e.second.get();
+    }
+    frameCache.emplace_back(frameId, estimator.multiFrame(StateId(frameId)));
+    return frameCache.back().second.get();
+  };
+  auto cachedT_WC = [&](uint64_t frameId, uint32_t camIdx)
+      -> const kinematics::Transformation& {
+    const uint64_t key = (frameId << 3) | uint64_t(camIdx);
+    for (auto& e : T_WC_cache) {
+      if (e.first == key) return e.second;
+    }
+    T_WC_cache.emplace_back(key, estimator.pose(StateId(frameId))
+                                     * (*multiFrame->T_SC(camIdx)));
+    return T_WC_cache.back().second;
+  };
+
+  double bestScores[D];
+  size_t rowCursor = 0;   // next free descriptor row in out.desc
+  for (size_t i = 0; i < numLandmarks; ++i) {
+    const LandmarkId landmarkId(soaPointMap_.id[i]);
+    if (loopClosureLandmarksToUseExclusively
+        && !loopClosureLandmarksToUseExclusively->count(landmarkId)) {
+      continue;
+    }
+
+    // FoV check
+    const double* pt = &soaPointMap_.point[4 * i];
+    const Eigen::Vector4d hp_W(pt[0], pt[1], pt[2], pt[3]);
+    const Eigen::Vector3d p_W = hp_W.head<3>() / hp_W[3];
+    const Eigen::Vector3d r_W = p_W - T_WC1.r();
+    const Eigen::Vector3d e_W = r_W.normalized();
+    const double r = std::max(0.01, r_W.norm());
+
+    const Eigen::Vector4d hp_C = T_CW1 * hp_W;
+    Eigen::Vector2d kp;
+    const cameras::ProjectionStatus status = geometry->projectHomogeneous(hp_C, &kp);
+    if (status == cameras::ProjectionStatus::Invalid
+        || status == cameras::ProjectionStatus::Behind) {
+      continue;
+    }
+    if (kp[0] < -reprThreshold) continue;
+    if (kp[1] < -reprThreshold) continue;
+    if (kp[0] > maxU) continue;
+    if (kp[1] > maxV) continue;
+
+    const double quality = soaPointMap_.quality[i];
+    bool is3d = false;
+    uint8_t* descSlot = out.desc.data() + rowCursor * B;
+    double eWbuf[3 * D];
+    double rWbuf[3 * D];
+    for (int n = 0; n < D; ++n) bestScores[n] = 1.0;
+
+    // The arena is reused across frames, so clear the slot: without this a row
+    // that no observation writes would expose whatever the previous frame left
+    // there, which is the same defect as the stock pool (see the crop below) and
+    // would additionally make the table depend on replay history.
+    std::memset(descSlot, 0, size_t(D) * B);
+    std::memset(eWbuf, 0, sizeof(eWbuf));
+    std::memset(rWbuf, 0, sizeof(rWbuf));
+
+    size_t o = 0;
+    const int32_t obsFrom = soaPointMap_.obsBegin[i];
+    const int32_t obsTo = soaPointMap_.obsBegin[i + 1];
+    // Descending observation order, matching the stock reverse iteration over
+    // the std::set: which descriptors survive depends on the order they are
+    // scored in, so this is not a free choice.
+    for (int32_t j = obsTo - 1; j >= obsFrom; --j) {
+      const uint64_t obsFrameId = soaPointMap_.obsFrameId[size_t(j)];
+      const uint32_t obsCamIdx = soaPointMap_.obsCamIdx[size_t(j)];
+      const uint32_t obsKptIdx = soaPointMap_.obsKptIdx[size_t(j)];
+
+      const kinematics::Transformation& T_WC_old = cachedT_WC(obsFrameId, obsCamIdx);
+      const Eigen::Vector3d r_W_old = p_W - T_WC_old.r();
+
+      // check if 3D
+      if (!is3d) {
+        const Eigen::Vector3d r_close_W = r_W - (0.2 / focalLength / quality * r_W_old);
+        const double cosA = r_W.normalized().dot(r_close_W.normalized());
+        if (cosA > cos(10.0 / focalLength)) {
+          is3d = true;
+        }
+      }
+
+      // over 35 degree viewpoint change
+      const double cosViewpointChnage = e_W.dot(r_W_old.normalized());
+      if (cosViewpointChnage < cos(0.6) && !loopClosureLandmarksToUseExclusively) {
+        continue;
+      }
+
+      // scale change over 50%
+      const double scaleChange = fabs(r - r_W_old.norm()) / r;
+      if ((scaleChange > 0.5) && !loopClosureLandmarksToUseExclusively) {
+        continue;
+      }
+
+      const double score = 0.5 * (acos(cosViewpointChnage) / 0.6 + scaleChange / 0.5);
+      double worstScore = 0.0;
+      size_t worstIdx = 0;
+      for (int n = 0; n < D; ++n) {
+        if (bestScores[n] > worstScore) {
+          worstScore = bestScores[n];
+          worstIdx = size_t(n);
+        }
+      }
+      if (score < bestScores[worstIdx]) {
+        const MultiFrame* oldFrame = cachedFrame(obsFrameId);
+        std::memcpy(descSlot + B * worstIdx,
+                    oldFrame->keypointDescriptor(obsCamIdx, obsKptIdx), B);
+        Eigen::Vector3d e_C;
+        oldFrame->getBackProjection(obsCamIdx, obsKptIdx, e_C);
+        Eigen::Map<Eigen::Vector3d>(eWbuf + 3 * worstIdx) =
+            T_WC_old.C() * e_C.normalized();
+        Eigen::Map<Eigen::Vector3d>(rWbuf + 3 * worstIdx) = T_WC_old.r();
+        o = std::max(o, worstIdx);
+        bestScores[worstIdx] = score;
+      }
+    }
+
+    // Row count follows the stock crop exactly, including the case where every
+    // observation was rejected: o starts at 0 and is never written, so stock
+    // still publishes one row. Stock leaves that row uninitialised (it is a
+    // slice of a freshly malloc'ed cv::Mat) and then scores keypoints against
+    // it; the arena was zeroed above, so here it reads as zeros. OKVIS_SOA=2
+    // zeroes the stock pool as well, which makes the two paths comparable byte
+    // for byte instead of leaving this case permanently unexplainable.
+    const int rows = int(o) + 1;
+    out.id.push_back(landmarkId.value());
+    out.projXY.push_back(kp[0]);
+    out.projXY.push_back(kp[1]);
+    out.descRow.push_back(int32_t(rowCursor));
+    out.descRows.push_back(rows);
+    out.is3d.push_back(is3d ? 1 : 0);
+    const int32_t classification = soaPointMap_.classification[i];
+    out.ignore.push_back((classification == 10 || classification == 11) ? 1 : 0);
+    out.eW.insert(out.eW.end(), eWbuf, eWbuf + 3 * D);
+    out.rW.insert(out.rW.end(), rWbuf, rWbuf + 3 * D);
+    rowCursor += size_t(rows);
+  }
+  out.rowsUsed = rowCursor;
+}
+
+// Match a new multiframe to existing keyframes:
+template <class CAMERA_GEOMETRY, class CANDIDATES>
 void Frontend::matchToMapByThread(
     size_t threadIdx, size_t numThreads, const Estimator &estimator,
     const okvis::ViParameters& params, const uint64_t currentFrameId,
     const std::set<LandmarkId>* loopClosureLandmarksToUseExclusively,
     const kinematics::Transformation& T_WS1,
-    const AlignedMap<LandmarkId, LandmarkToMatch>& landmarksToMatch,
-    size_t numKeypoints, const MapPoints& pointMap,
+    const CANDIDATES& landmarksToMatch,
+    size_t numKeypoints,
     size_t im, const MultiFramePtr&  multiFrame, std::vector<double>& distances,
     std::vector<LandmarkId>& lmIds, AlignedVector<Eigen::Vector4d>& hps_W,
     std::vector<size_t>& ctrs,
@@ -1879,18 +2615,22 @@ void Frontend::matchToMapByThread(
   }
   for(auto it = landmarksToMatch.begin(); it != landmarksToMatch.end(); ++it) {
 
-    if(!it->second.is3d) {
+    if(!landmarksToMatch.is3d(it)) {
       continue;
     }
 
+    const LandmarkId candidateId = landmarksToMatch.id(it);
     if(loopClosureLandmarksToUseExclusively) {
-      if(!loopClosureLandmarksToUseExclusively->count(it->first)) {
+      if(!loopClosureLandmarksToUseExclusively->count(candidateId)) {
         continue; // skip non-loop-closure points in this case
       }
     }
 
     // match all present descriptors
-    const Eigen::Vector2d projection = it->second.projection;
+    const double* proj = landmarksToMatch.projXY(it);
+    const Eigen::Vector2d projection(proj[0], proj[1]);
+    const uchar* candidateDescriptors = landmarksToMatch.desc(it);
+    const int numCandidateDescriptors = landmarksToMatch.descRows(it);
     for(size_t k = startK; k < endK; k++) {
 
       if(!use[k]) {
@@ -1904,13 +2644,13 @@ void Frontend::matchToMapByThread(
       }
 
       const uchar* descriptorK = ddata + k*48;
-      for(int d = 0; d<it->second.descriptors.rows; ++d) {
+      for(int d = 0; d<numCandidateDescriptors; ++d) {
         const double dist = brisk::Hamming::PopcntofXORed(
             descriptorK,
-            it->second.descriptors.data + d*48, 3);
+            candidateDescriptors + d*48, 3);
         if(dist < distances[k]) {
           distances[k] = dist;
-          lmIds[k] = it->first;
+          lmIds[k] = candidateId;
           ctrs[threadIdx]++;
           reprErrors[threadIdx] += sqrt(reprDist.dot(reprDist));
         }
@@ -1921,14 +2661,14 @@ void Frontend::matchToMapByThread(
 }
 
 // Match a new multiframe to existing keyframes:
-template <class CAMERA_GEOMETRY>
+template <class CAMERA_GEOMETRY, class CANDIDATES>
 void Frontend::matchToMapByThreadUnitialised(
     size_t threadIdx, size_t numThreads, const Estimator &estimator,
     const okvis::ViParameters& params, const uint64_t currentFrameId,
     const std::set<LandmarkId>* loopClosureLandmarksToUseExclusively,
     const kinematics::Transformation& T_WS1,
-    const AlignedMap<LandmarkId, LandmarkToMatch>& landmarksToMatch,
-    size_t numKeypoints, const MapPoints& pointMap,
+    const CANDIDATES& landmarksToMatch,
+    size_t numKeypoints,
     size_t im, const MultiFramePtr&  multiFrame, std::vector<double>& distances,
     std::vector<LandmarkId>& lmIds, AlignedVector<Eigen::Vector4d>& hps_W,
     std::vector<size_t>& ctrs) const {
@@ -1969,17 +2709,20 @@ void Frontend::matchToMapByThreadUnitialised(
   const double cos6Sigma = cos(6.0*sigma);
   for(auto it = landmarksToMatch.begin(); it != landmarksToMatch.end(); ++it) {
 
-    if(it->second.is3d) {
+    if(landmarksToMatch.is3d(it)) {
       continue;
     }
 
+    const LandmarkId candidateId = landmarksToMatch.id(it);
     if(loopClosureLandmarksToUseExclusively) {
-      if(!loopClosureLandmarksToUseExclusively->count(it->first)) {
+      if(!loopClosureLandmarksToUseExclusively->count(candidateId)) {
         continue; // skip non-loop-closure points in this case
       }
     }
 
     // match all present descriptors
+    const uchar* candidateDescriptors = landmarksToMatch.desc(it);
+    const int numCandidateDescriptors = landmarksToMatch.descRows(it);
     for(size_t k = startK; k < endK; k++) {
 
       if(!use[k]) {
@@ -1989,15 +2732,17 @@ void Frontend::matchToMapByThreadUnitialised(
       // also check epipolar distance (later)
       const Eigen::Vector3d e1_W=e_Ws.col(k);
       const uchar* descriptorK = ddata + k*48;
-      for(int d = 0; d<it->second.descriptors.rows; ++d) {
+      for(int d = 0; d<numCandidateDescriptors; ++d) {
         const double dist = brisk::Hamming::PopcntofXORed(
-            descriptorK, it->second.descriptors.data + d*48, 3);
+            descriptorK, candidateDescriptors + d*48, 3);
 
         if(dist < distances[k]) {
 
           // epipolar distance check
-          const Eigen::Vector3d e0_W = it->second.e_W.col(d);
-          const Eigen::Vector3d r0_W = it->second.r_W.col(d);
+          const double* eWd = landmarksToMatch.eW(it, d);
+          const double* rWd = landmarksToMatch.rW(it, d);
+          const Eigen::Vector3d e0_W(eWd[0], eWd[1], eWd[2]);
+          const Eigen::Vector3d r0_W(rWd[0], rWd[1], rWd[2]);
 
           if(e0_W.dot(e1_W)<cos6Sigma) { // otherwise parallel... will be OK.
             const Eigen::Vector3d et_W = (T_WC1.r() - r0_W).normalized();
@@ -2033,13 +2778,13 @@ void Frontend::matchToMapByThreadUnitialised(
             continue;
           }
 
-          if(it->first.value()==previousIds[k]) {
+          if(candidateId.value()==previousIds[k]) {
             ctrs[threadIdx]++; // still counts, already correct match...
             break; // the match is already done...
           }
 
           distances[k] = dist;
-          lmIds[k] = it->first;
+          lmIds[k] = candidateId;
           ctrs[threadIdx]++;
           if(!isParallel) {
             hps_W[k] = hp_W;
@@ -2117,6 +2862,7 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
       const double f0 = 0.5* (camera->focalLengthU() + camera->focalLengthV());
 
       // preprocess matchable set, get descriptors close in memory
+      TimerSwitchable tMsMatch("2.02.2 motion stereo: descriptor match (per older frame)");
       std::vector<size_t> k1s;
       k1s.reserve(k1Size);
       cv::Mat desc1(k1Size, 48, CV_8UC1);
@@ -2240,8 +2986,10 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
       std::for_each(workers.begin(), workers.end(), [](std::thread &worker) {
           worker.join();
       });
+      tMsMatch.stop();
 
       // finally insert the actual matches
+      TimerSwitchable tMsInsert("2.02.3 motion stereo: insert matches (per older frame)");
       for(size_t k0=0; k0<k0Size; ++k0) {
         const MatchInfo & mInfo = matchInfos.at(k0);
         uint64_t id0 = multiFrame0->landmarkId(im, k0);
@@ -2267,9 +3015,16 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
         }
 
         if(id0){
-          MapPoint2 lm;
-          estimator.getLandmark(LandmarkId(id0), lm);
-          if(lm.quality<mInfo.quality) {
+          double lmQuality = 0.0;
+          if (lightLandmarkLookup) {
+            Eigen::Vector4d lmPoint;
+            estimator.landmarkPositionAndQuality(LandmarkId(id0), lmPoint, lmQuality);
+          } else {
+            MapPoint2 lm;
+            estimator.getLandmark(LandmarkId(id0), lm);
+            lmQuality = lm.quality;
+          }
+          if(lmQuality<mInfo.quality) {
             estimator.setLandmark(LandmarkId(id0), mInfo.hp_W, mInfo.initialisable);
           }
         } else {
@@ -2285,6 +3040,7 @@ int Frontend::matchMotionStereo(Estimator& estimator, const ViParameters &params
               LandmarkId(id0), StateId(currentFrameId), im, mInfo.k1);
         retCtr++;
       }
+      tMsInsert.stop();
     }
 
     bool rotationOnly_tmp = false;
@@ -2505,10 +3261,18 @@ int Frontend::removeOutliers(Estimator &estimator,
         if (currentFrame->getKeypoint(im, k, pt)) {
           //Eigen::Vector3d e_Ci;
           //if (currentFrame->getBackProjection(im, k, e_Ci)) {
+          // Only the position is used below, but getLandmark() also deep-copies the
+          // landmark's observation set (one heap node per observation) for every one
+          // of the ~800 matched keypoints, three times per frame.
+          Eigen::Vector4d lmPoint;
+          double lmQuality = 0.0;
           MapPoint2 lm;
-          if (estimator.getLandmark(LandmarkId(lmId), lm)) {
+          const bool haveLm = lightLandmarkLookup
+              ? estimator.landmarkPositionAndQuality(LandmarkId(lmId), lmPoint, lmQuality)
+              : (estimator.getLandmark(LandmarkId(lmId), lm) ? (lmPoint = lm.point, true) : false);
+          if (haveLm) {
             bool remove = false;
-            const Eigen::Vector4d hp_W = lm.point;
+            const Eigen::Vector4d hp_W = lmPoint;
             Eigen::Vector4d hp_Ci = T_CiW * hp_W;
             const auto camera = currentFrame->geometryAs<CAMERA_GEOMETRY>(im);
             if (cameras::ProjectionStatus::Successful == camera->projectHomogeneous(hp_Ci, &proj)) {
