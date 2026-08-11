@@ -278,6 +278,22 @@ class MultiFrame
   /// \return The number of keypoints.
   inline size_t numKeypoints(size_t cameraIdx) const;
 
+  /// \brief Version counter of this camera's landmark IDs, see Frame::landmarkIdVersion().
+  /// @param[in] cameraIdx The camera index.
+  /// \return The version.
+  inline uint64_t landmarkIdVersion(size_t cameraIdx) const {
+    OKVIS_ASSERT_TRUE_DBG(Exception, cameraIdx < frames_.size(), "camera index out of range")
+    return frames_[cameraIdx].landmarkIdVersion();
+  }
+
+  /// \brief Version counter of this camera's keypoints, see Frame::keypointVersion().
+  /// @param[in] cameraIdx The camera index.
+  /// \return The version.
+  inline uint64_t keypointVersion(size_t cameraIdx) const {
+    OKVIS_ASSERT_TRUE_DBG(Exception, cameraIdx < frames_.size(), "camera index out of range")
+    return frames_[cameraIdx].keypointVersion();
+  }
+
   /// @}
 
   /// \brief Get the total number of keypoints in all frames.

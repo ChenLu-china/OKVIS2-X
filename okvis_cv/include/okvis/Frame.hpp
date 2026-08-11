@@ -224,6 +224,22 @@ class Frame
   /// \return The number of keypoints.
   inline size_t numKeypoints() const;
 
+  /// \brief Counter bumped whenever any landmark ID of this frame changes.
+  /// Keypoints are written once by detect()/describe() and then never move, but
+  /// landmark IDs keep changing for the whole life of the frame (data
+  /// association assigns them, outlier rejection zeroes them again). Anything
+  /// caching a per-frame quantity derived from the landmark IDs can compare this
+  /// counter instead of re-deriving the quantity.
+  /// \return The version.
+  inline uint64_t landmarkIdVersion() const { return landmarkIdVersion_; }
+
+  /// \brief Counter bumped whenever the keypoints or the image of this frame change.
+  /// In the live pipeline this settles after describe() and never moves again,
+  /// but resetKeypoints() exists (map loading, tests), so a cache of anything
+  /// derived from the keypoints should compare this rather than assume.
+  /// \return The version.
+  inline uint64_t keypointVersion() const { return keypointVersion_; }
+
  protected:
   cv::Mat image_;  ///< the image as OpenCV's matrix
   cv::Mat depthImage_;  ///< the depth image as OpenCV's matrix
@@ -242,6 +258,8 @@ class Frame
   std::vector<uint64_t> landmarkIds_;  ///< landmark Id, if associated -- 0 otherwise
   std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> landmarks_; ///< pos in C.
   std::vector<bool> landmarkInitialisations_; ///< Store landmark initialisation stati.
+  uint64_t landmarkIdVersion_ = 0; ///< Bumped on every landmark ID change, see landmarkIdVersion().
+  uint64_t keypointVersion_ = 0;   ///< Bumped on every keypoint/image change, see keypointVersion().
   std::atomic_bool isClassified_; ///< Store if classified (yet).
 };
 

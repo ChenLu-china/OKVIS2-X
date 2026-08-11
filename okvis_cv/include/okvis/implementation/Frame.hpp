@@ -50,6 +50,7 @@ void Frame::setImage(const cv::Mat & image)
 {
   //cv::medianBlur(image,image_,3);
   image_ = image;
+  ++keypointVersion_;
 }
 
 // set the frame image;
@@ -130,6 +131,7 @@ int Frame::detect()
   OKVIS_ASSERT_TRUE_DBG(Exception, detector_ != nullptr,
                         "Detector not initialised!")
   detector_->detect(image_, keypoints_);
+  ++keypointVersion_;
   return int(keypoints_.size());
 }
 
@@ -144,13 +146,15 @@ int Frame::describe()
                         "Detector not initialised!")
 
   // extraction
-  extractor_->compute(image_, keypoints_, descriptors_);
+  extractor_->compute(image_, keypoints_, descriptors_); // may drop keypoints
+  ++keypointVersion_;
 
   // resizing
   landmarkIds_ = std::vector<uint64_t>(keypoints_.size(),0);
   landmarks_ = std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>>(
         keypoints_.size(), Eigen::Vector4d(0,0,0,0));
   landmarkInitialisations_ = std::vector<bool>(keypoints_.size(), false);
+  ++landmarkIdVersion_;
   return int(keypoints_.size());
 }
 
@@ -279,9 +283,11 @@ bool Frame::setLandmarkId(size_t keypointIdx, uint64_t landmarkId)
       keypointIdx < landmarkIds_.size(),
       "keypointIdx " << keypointIdx
         << "out of range: landmarkIds_ has size "<< landmarkIds_.size())
+  landmarkIdVersion_ += (landmarkIds_[keypointIdx] != landmarkId);
   landmarkIds_[keypointIdx] = landmarkId;
   return keypointIdx < keypoints_.size();
 #else
+  landmarkIdVersion_ += (landmarkIds_[keypointIdx] != landmarkId);
   landmarkIds_[keypointIdx] = landmarkId;
   return true;
 #endif
@@ -340,12 +346,14 @@ bool Frame::getLandmark(size_t keypointIdx, Eigen::Vector4d & landmark, bool & i
 // provide keypoints externally
 inline bool Frame::resetKeypoints(const std::vector<cv::KeyPoint> & keypoints) {
   keypoints_ = keypoints;
+  ++keypointVersion_;
 
   // resizing
   landmarkIds_ = std::vector<uint64_t>(keypoints_.size(),0);
   landmarks_ = std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>>(
     keypoints_.size(), Eigen::Vector4d(0,0,0,0));
   landmarkInitialisations_ = std::vector<bool>(keypoints_.size(), false);
+  ++landmarkIdVersion_;
 
   return true;
 }
