@@ -21,6 +21,11 @@ target_include_directories(${LIB_NAME}
     $<INSTALL_INTERFACE:include>
   PRIVATE
     ${GLOG_INCLUDE_DIRS}
+    # Ubuntu's OpenCVConfig.cmake fills OpenCV_LIBS with bare .so paths instead
+    # of the imported targets upstream assumes, so linking it carries no header
+    # path and <opencv2/core.hpp> is unreachable. Every other target here gets
+    # the path by accident (via brisk or its own find_package); this one did not.
+    ${OpenCV_INCLUDE_DIRS}
 )
 target_link_libraries(${LIB_NAME}
   PUBLIC
