@@ -276,6 +276,41 @@ class ViSlamBackend //: public VioBackendInterface
   size_t getLandmarks(MapPoints &landmarks) const;
 
   /**
+   * @brief Update an existing landmark snapshot in place (see ViGraph::syncLandmarks).
+   * @param[in,out] landmarks The landmarks (may hold a previous snapshot).
+   * @return number of landmarks.
+   */
+  size_t syncLandmarks(MapPoints &landmarks) const;
+
+  /**
+   * @brief Copy all landmarks out as parallel arrays (see ViGraph::getLandmarksSoA).
+   * @param[in,out] landmarks The flat snapshot.
+   * @return number of landmarks.
+   */
+  size_t getLandmarksSoA(MapPointsSoA &landmarks) const;
+
+  /**
+   * @brief Get just position and quality of a landmark, without copying its observations.
+   * @param[in] landmarkId The ID of the landmark.
+   * @param[out] homogeneousPoint The landmark position estimate (in World frame).
+   * @param[out] quality The landmark quality.
+   * @return True if the landmark exists.
+   */
+  bool landmarkPositionAndQuality(LandmarkId landmarkId, Eigen::Vector4d &homogeneousPoint,
+                                  double &quality) const {
+    return realtimeGraph_.landmarkPositionAndQuality(landmarkId, homogeneousPoint, quality);
+  }
+
+  /**
+   * @brief Fill the publishable landmark vector without copying observation sets.
+   * @param[out] landmarks The landmarks to publish.
+   * @return number of landmarks.
+   */
+  size_t getLandmarksForPublish(MapPointVector &landmarks) const {
+    return realtimeGraph_.getLandmarksForPublish(landmarks);
+  }
+
+  /**
    * @brief Get a multiframe.
    * @param stateId ID of desired multiframe.
    * @return Shared pointer to multiframe.
@@ -687,6 +722,83 @@ private:
   /// \brief Delete place recognition frames with much overlap from database.
   /// \return Number of pruned frames.
   int prunePlaceRecognitionFrames();
+
+  /// \brief Reference implementation of overlapFraction(), left as it was so
+  /// that OKVIS_OVERLAP_CACHE=0 is provably stock and =2 has something to
+  /// compare against.
+  double overlapFractionStock(const MultiFramePtr frameA, const MultiFramePtr frameB) const;
+
+  /// \brief overlapFraction() over per-frame quantities cached in overlapCache_.
+  /// @param[in] frameA Frame A.
+  /// @param[in] frameB Frame B.
+  /// @param[in] verify Re-derive every cached quantity and check it, for mode 2.
+  /// \return The overlap fraction, bit-identical to overlapFractionStock().
+  double overlapFractionCached(const MultiFramePtr frameA, const MultiFramePtr frameB,
+                               bool verify) const;
+
+  /// \brief The parts of overlapFraction() that depend on one frame only.
+  ///
+  /// The detection mask is a function of that frame's keypoints alone, so it is
+  /// painted once per (frame, camera) instead of once per overlap query. Both it
+  /// and the landmark ID list carry the version they were built at rather than
+  /// assuming immutability: keypoints do settle after Frame::describe() in the
+  /// live pipeline, but Frame::resetKeypoints() exists, and landmark IDs change
+  /// for the whole life of the frame.
+  struct OverlapFrameCache {
+    std::vector<cv::Mat> detections;  ///< Per camera, CV_8UC1 at image size / 10.
+    std::vector<int> detectionArea;   ///< Per camera, countNonZero(detections).
+    std::vector<uint64_t> keypointVersion;  ///< Version detections was painted at.
+    std::vector<std::vector<uint64_t>> landmarkIds;  ///< Per camera, sorted, unique, no zeros.
+    std::vector<uint64_t> landmarkIdVersion;  ///< Version landmarkIds was built at.
+  };
+  /// Keyed by MultiFrame::id(). Only ever touched by whichever single thread is
+  /// inside the estimator: the front end reaches overlapFraction() from
+  /// "2 Match", which runs after "1.9 wait" has joined the optimisation thread.
+  mutable std::map<uint64_t, OverlapFrameCache> overlapCache_;
+  mutable std::vector<cv::Mat> matchMaskScratch_;  ///< Reused match-mask buffers.
+  mutable std::vector<uint64_t> mergedScratch_[2]; ///< Reused all-camera landmark ID lists.
+  mutable std::vector<uint64_t> matchScratch_;     ///< Reused landmark intersection buffer.
+
+  /// \brief Memo of recent mostOverlappedStateId() answers.
+  ///
+  /// The answer is a function of the query frame, the candidate list, and the
+  /// keypoints and landmark IDs of all of those frames, so the memo stores
+  /// exactly those (the latter two as version counters) and is only used when all
+  /// of them still compare equal -- a few dozen integer comparisons against a few
+  /// hundred microseconds of IoU work.
+  ///
+  /// Note what is deliberately *not* part of the key: the
+  /// considerLoopClosureFrames argument. It reaches the answer only by removing
+  /// currentLoopClosureFrames_ from the candidate list, so two calls that differ
+  /// in the flag but end up with the same candidate list must agree. That is
+  /// what makes the two sweeps of "4.0b" and "7.1b" share an answer while
+  /// loop closures are off, without assuming they always will.
+  struct OverlapMemo {
+    StateId query;                   ///< Query frame it was built for.
+    std::vector<StateId> candidates; ///< Candidate list it was built from.
+    std::vector<uint64_t> versions;  ///< Per camera version pairs, query frame first.
+    StateId result;                  ///< The memoised answer.
+  };
+  /// Four slots: one frame issues up to four queries, of which one is for a
+  /// different (retiring) frame, so nothing useful is evicted within a frame.
+  mutable std::vector<OverlapMemo> overlapMemo_;
+  mutable size_t overlapMemoNext_ = 0;                 ///< Round-robin slot to overwrite.
+  mutable std::vector<StateId> memoCandidateScratch_;  ///< Reused candidate list.
+  mutable std::vector<uint64_t> memoVersionScratch_;   ///< Reused version stamps.
+
+  /// \brief Reference implementation of mostOverlappedStateId(), left as it was
+  /// so that OKVIS_OVERLAP_MEMO=0 is provably stock.
+  StateId mostOverlappedStateIdStock(StateId frame, bool considerLoopClosureFrames) const;
+
+  /// \brief Reference implementation of getObservedIds(), left as it was so that
+  /// OKVIS_OBSIDS_FLAT=0 is provably stock.
+  bool getObservedIdsStock(StateId id, std::set<StateId>& observedIds) const;
+
+  /// \brief getObservedIds() over sorted vectors instead of nested std::set.
+  bool getObservedIdsFlat(StateId id, std::set<StateId>& observedIds) const;
+
+  mutable std::vector<uint64_t> obsIdsFrameScratch_;    ///< Reused frame ID list.
+  mutable std::vector<uint64_t> obsIdsLandmarkScratch_; ///< Reused landmark ID list.
 
   std::map<StateId, MultiFramePtr> multiFrames_; ///< All the multiframes added so far.
 

@@ -73,6 +73,79 @@ void accumulateCeresStats(const ::ceres::Solver::Summary &s, bool matchToMapPath
               << ", effective params " << s.num_effective_parameters;
   }
 }
+
+int envMode(const char* name) {
+  const char* e = std::getenv(name);
+  return e ? std::atoi(e) : 0;
+}
+
+// Cache the parts of overlapFraction() that depend on a single frame.
+// VIO_PROFILING.md 3.18.5 measures overlapFraction at 8.04 ms/frame on the
+// back-end thread, most of it repainting detection masks that cannot have
+// changed: the mask is a function of that frame's keypoints, and keypoints are
+// written once by Frame::describe() and never move again. Nothing about the IoU,
+// the comparison or any decision changes.
+//   0 (default) = stock, untouched
+//   1 = the cached path replaces it
+//   2 = self-check: keep the stock answer, and on every call re-derive every
+//       cached quantity and compare -- masks byte for byte, IoU bit for bit.
+int overlapCacheMode() {
+  static const int mode = envMode("OKVIS_OVERLAP_CACHE");
+  return mode;
+}
+
+// Memoise mostOverlappedStateId() across the up to four sweeps one frame makes
+// (4.0b, 7.1b, 7.3b, 7.6a in VIO_PROFILING.md 3.18.5). The memo is only used
+// when the candidate list and every involved frame's landmark ID version still
+// compare equal, so it cannot outlive a change that would move the answer.
+//   0 (default) = stock, 1 = memo, 2 = self-check against a full recomputation.
+int overlapMemoMode() {
+  static const int mode = envMode("OKVIS_OVERLAP_MEMO");
+  return mode;
+}
+
+// getObservedIds() over sorted vectors instead of two nested std::set. The
+// answer is a set of at most a couple of dozen frame IDs, reached via a
+// std::set of ~900 landmark IDs; VIO_PROFILING.md 3.18.4 puts it about 40x off
+// its arithmetic lower bound.
+//   0 (default) = stock, 1 = flat, 2 = self-check against the stock set.
+int obsIdsFlatMode() {
+  static const int mode = envMode("OKVIS_OBSIDS_FLAT");
+  return mode;
+}
+
+// Tally for the self-check modes. Reported at exit rather than per call: the
+// point of a self-check run is a single "compared N, mismatched 0" line that can
+// be quoted, and a mismatch throws anyway.
+struct EquivalenceTally {
+  std::atomic<uint64_t> compared[4] = {};
+  std::atomic<uint64_t> mismatched[4] = {};
+  std::atomic<uint64_t> memoCalls{0};  ///< mostOverlappedStateId calls with the memo live.
+  std::atomic<uint64_t> memoHits{0};   ///< ... of which answered from the memo.
+  ~EquivalenceTally() {
+    static const char* what[4] = {"overlapFraction IoU", "detection mask bytes",
+                                  "mostOverlappedStateId", "getObservedIds"};
+    for (int i = 0; i < 4; ++i) {
+      if (compared[i].load() == 0) continue;
+      LOG(INFO) << "[equiv] " << what[i] << ": compared " << compared[i].load()
+                << ", mismatched " << mismatched[i].load();
+    }
+    if (memoCalls.load()) {
+      LOG(INFO) << "[equiv] mostOverlappedStateId memo: " << memoHits.load() << " hits / "
+                << memoCalls.load() << " calls";
+    }
+  }
+};
+EquivalenceTally& tally() {
+  static EquivalenceTally t;
+  return t;
+}
+void noteCompared(int which, bool equal) {
+  tally().compared[which].fetch_add(1, std::memory_order_relaxed);
+  if (!equal) {
+    tally().mismatched[which].fetch_add(1, std::memory_order_relaxed);
+  }
+}
 }  // namespace
 
 int ViSlamBackend::addCamera(const CameraParameters &cameraParameters)
@@ -296,6 +369,16 @@ size_t ViSlamBackend::getLandmarks(MapPoints & landmarks) const
   return realtimeGraph_.getLandmarks(landmarks);
 }
 
+size_t ViSlamBackend::syncLandmarks(MapPoints & landmarks) const
+{
+  return realtimeGraph_.syncLandmarks(landmarks);
+}
+
+size_t ViSlamBackend::getLandmarksSoA(MapPointsSoA & landmarks) const
+{
+  return realtimeGraph_.getLandmarksSoA(landmarks);
+}
+
 double ViSlamBackend::trackingQuality(StateId id) const
 {
   const MultiFramePtr frame = multiFrame(id);
@@ -425,6 +508,7 @@ bool ViSlamBackend::convertToPoseGraphMst(const std::set<StateId> & framesToConv
                                           const std::set<StateId> & framesToConsider,
                                           std::set<StateId> & affectedFrames) {
   // remember landmarks in frames (transformed to sensor frame)
+  TimerSwitchable t3c("7.3c write landmarks back into multiframes");
   for(auto pose : framesToConvert) {
     ViGraph::State& state = realtimeGraph_.states_.at(pose);
     kinematics::Transformation T_SW = state.pose->estimate().inverse();
@@ -441,12 +525,16 @@ bool ViSlamBackend::convertToPoseGraphMst(const std::set<StateId> & framesToConv
     }
   }
 
+  t3c.stop();
+
   std::vector<ViGraphEstimator::PoseGraphEdge> poseGraphEdges;
   std::vector<std::pair<StateId,StateId>> removedTwoPoseErrors;
   std::vector<KeypointIdentifier> removedObservations;
+  TimerSwitchable t3d("7.3d realtimeGraph convertToPoseGraphMst");
   realtimeGraph_.convertToPoseGraphMst(
         framesToConvert, framesToConsider, &poseGraphEdges, &removedTwoPoseErrors,
         &removedObservations);
+  t3d.stop();
 
   // remember affected frames
   for (auto addedEdge : poseGraphEdges) {
@@ -479,6 +567,7 @@ bool ViSlamBackend::convertToPoseGraphMst(const std::set<StateId> & framesToConv
     }
   } else {
     // replicate fullGraph_
+    TimerSwitchable t3e("7.3e fullGraph replicate posegraph conversion");
     for(auto obs : removedObservations) {
       fullGraph_.removeObservation(obs);
     }
@@ -491,6 +580,7 @@ bool ViSlamBackend::convertToPoseGraphMst(const std::set<StateId> & framesToConv
             poseGraphEdge.referenceId, poseGraphEdge.otherId);
 
     }
+    t3e.stop();
   }
 
   return true;
@@ -507,13 +597,16 @@ int ViSlamBackend::expandKeyframe(StateId keyframe)
   std::set<LandmarkId> lms;
   std::set<StateId> cnncts;
   std::vector<ceres::TwoPoseGraphError::Observation> allObservations;
+  TimerSwitchable t6c("7.6c realtimeGraph convertToObservations");
   realtimeGraph_.convertToObservations(keyframe, &lms, &cnncts, &allObservations);
+  t6c.stop();
 
   // also manage the full graph, if possible
   if(isLoopClosing_ || isLoopClosureAvailable_) {
     touchedStates_.insert(cnncts.begin(), cnncts.end());
     touchedLandmarks_.insert(lms.begin(), lms.end());
   } else {
+    TimerSwitchable t6d("7.6d fullGraph replicate expansion");
     fullGraph_.removeTwoPoseConstLinks(keyframe);
     for(auto lm : lms) {
       const auto & landmark = realtimeGraph_.landmarks_.at(lm);
@@ -528,6 +621,7 @@ int ViSlamBackend::expandKeyframe(StateId keyframe)
       fullGraph_.addExternalObservation(obs.reprojectionError, landmarkId,
                              obs.keypointIdentifier, useCauchy);
     }
+    t6d.stop();
   }
 
   for(auto cnnct : cnncts) {
@@ -563,10 +657,22 @@ void ViSlamBackend::eliminateImuFrames(size_t numImuFrames, std::set<StateId> & 
       }
       auxiliaryStates_.at(id).isImuFrame = false;
     } else {
+      // Split realtime-graph work from the fullGraph_ replication below: with
+      // do_loop_closures off the full graph is only ever read by the final BA,
+      // so knowing what its upkeep costs per frame is a separate question from
+      // what the live estimator needs.
+      TimerSwitchable t2a("7.2a mostOverlappedStateId (overlapFraction)");
       StateId refId = mostOverlappedStateId(id, false);
+      t2a.stop();
+      TimerSwitchable t2b("7.2b copy observations map");
       auto observations = realtimeGraph_.states_.at(id).observations;
+      t2b.stop();
+      TimerSwitchable t2c("7.2c realtimeGraph removeAllObservations");
       realtimeGraph_.removeAllObservations(id);
+      t2c.stop();
+      TimerSwitchable t2d("7.2d realtimeGraph eliminateStateByImuMerge");
       realtimeGraph_.eliminateStateByImuMerge(id, refId);
+      t2d.stop();
 
       // also remove from loop closure frames
       if(loopClosureFrames_.count(id)) {
@@ -580,8 +686,12 @@ void ViSlamBackend::eliminateImuFrames(size_t numImuFrames, std::set<StateId> & 
         }
         eliminateStates_[id] = refId;
       } else {
+        TimerSwitchable t2e("7.2e fullGraph removeAllObservations");
         fullGraph_.removeAllObservations(id); /// \todo make more efficient (copy over)
+        t2e.stop();
+        TimerSwitchable t2f("7.2f fullGraph eliminateStateByImuMerge");
         fullGraph_.eliminateStateByImuMerge(id, refId); /// \todo make more efficient (copy over)
+        t2f.stop();
       }
       imuFrames_.erase(id);
       multiFrames_.erase(id);
@@ -617,9 +727,15 @@ bool ViSlamBackend::applyStrategy(size_t numKeyframes,
   eliminateImuFrames(numImuFrames, affectedFrames);
   t2.stop();
 
-  // now tackle keyframes, if necessary
+  // now tackle keyframes, if necessary. currentKeyframeStateId() runs
+  // overlapFraction against every keyframe, and each of those repaints both
+  // frames' detection masks from scratch. It happens on every frame, whereas
+  // the conversion below only fires when a keyframe actually retires, so the
+  // two are timed apart.
+  TimerSwitchable t1b("7.1b currentKeyframeStateId (overlapFraction)");
   StateId currentKeyframeId = currentKeyframeStateId();
   StateId currentFrameId = realtimeGraph_.currentStateId();
+  t1b.stop();
 
   if(!currentKeyframeId.isInitialised()) {
     return true; /// \todo fix this
@@ -632,9 +748,13 @@ bool ViSlamBackend::applyStrategy(size_t numKeyframes,
     TimerSwitchable t3("7.3 convert to posegraph");
     while(keyFrames_.size() > numKeyframes) {
       // find keyframe with least common observations with current frame or current keyframe
+      TimerSwitchable t3a("7.3a computeCovisibilities");
       realtimeGraph_.computeCovisibilities();
+      t3a.stop();
+      TimerSwitchable t3b("7.3b currentKeyframeStateId (overlapFraction)");
       currentKeyframeId = currentKeyframeStateId();
       currentFrameId = realtimeGraph_.currentStateId();
+      t3b.stop();
       StateId minId;
       int minObservations = 100000;
       for(auto keyFrame : keyFrames_) {
@@ -828,13 +948,19 @@ bool ViSlamBackend::applyStrategy(size_t numKeyframes,
   // expand frontier, if necessary
   if(expand && ctrLc<3 && ctrPg<3) {
     TimerSwitchable t6("7.6 expand");
+    // Third overlapFraction sweep of the frame (after 7.1b and 7.2a), and it
+    // only decides whether the current keyframe is a frontier node.
+    TimerSwitchable t6a("7.6a currentKeyframeStateId (overlapFraction)");
     currentKeyframeId = currentKeyframeStateId();
+    t6a.stop();
     if(currentKeyframeId.isInitialised()) {
       if(realtimeGraph_.states_.at(currentKeyframeId).twoPoseLinks.size()>0) {
         expandKeyframe(currentKeyframeId);
       }
     }
+    TimerSwitchable t6b("7.6b currentLoopclosureStateId (overlapFraction)");
     const StateId currentLoopclosureFrameId = currentLoopclosureStateId();
+    t6b.stop();
     if(currentLoopclosureFrameId.isInitialised()) {
       if(realtimeGraph_.states_.at(currentLoopclosureFrameId).twoPoseLinks.size()>0) {
         expandKeyframe(currentLoopclosureFrameId);
@@ -873,6 +999,30 @@ void ViSlamBackend::optimiseRealtimeGraph(
         realtimeGraph_.states_.at(StateId(1)).pose->estimate().r(),
         realtimeGraph_.states_.rbegin()->second.pose->estimate().q());
     realtimeGraph_.setPose(realtimeGraph_.states_.rbegin()->first, T_WS);
+  }
+
+  // matchToMap only wants the newest pose refined. Doing that on the full
+  // problem means Ceres rebuilds and reduces ~7000 residual blocks every call
+  // just to arrive at ~20 live ones; a dedicated problem skips that. Requires
+  // isInitialised, since the initial-fixation residual above lives directly on
+  // the full problem and is not mirrored.
+  static const bool smallProblemEnabled = []() {
+    const char* env = std::getenv("OKVIS_MTM_SMALL");
+    return env == nullptr || std::atoi(env) != 0;  // OKVIS_MTM_SMALL=0 to disable
+  }();
+  if(onlyNewestState && isInitialised && smallProblemEnabled) {
+    TimerSwitchable tSmall("3.2c pose-only solve (matchToMap path)");
+    if(realtimeGraph_.optimiseNewestStateOnly(numIter, numThreads, verbose)) {
+      tSmall.stop();
+      accumulateCeresStats(realtimeGraph_.summary(), true);
+      auto riter = realtimeGraph_.states_.rbegin();
+      if(!isLoopClosing_ && !isLoopClosureAvailable_) {
+        ViGraph::State & fullState = fullGraph_.states_.at(riter->first);
+        fullState.pose->setEstimate(riter->second.pose->estimate());
+        fullState.speedAndBias->setEstimate(riter->second.speedAndBias->estimate());
+      }
+      return;
+    }
   }
 
   // freeze if requested
@@ -917,6 +1067,37 @@ void ViSlamBackend::optimiseRealtimeGraph(
   // (the reduced system is far too small to amortise launch overhead) and it
   // competes with the depth network for the GPU.
   realtimeGraph_.options_.linear_solver_type = ::ceres::DENSE_SCHUR;
+
+  // Without an ordering Ceres rediscovers the Schur e-blocks on every Solve()
+  // by computing a maximal independent set: measured at 3.1 ms/frame, 27.5% of
+  // all preprocessor time. The split is known here -- landmarks are the
+  // e-blocks -- so hand it over. Only the main path benefits; matchToMap
+  // freezes every landmark, so its reduced problem has ~20 blocks left and the
+  // automatic ordering is already cheap.
+  static const int orderingMode = []() {
+    const char* env = std::getenv("OKVIS_CERES_ORDERING");
+    return env ? std::atoi(env) : 0;
+  }();
+  if (orderingMode == 1 && !onlyNewestState) {
+    TimerSwitchable tOrdering("3.1b build linear_solver_ordering");
+    auto ordering = std::make_shared<::ceres::ParameterBlockOrdering>();
+    std::vector<double*> parameterBlocks;
+    realtimeGraph_.problem_->GetParameterBlocks(&parameterBlocks);
+    for (double* block : parameterBlocks) {
+      ordering->AddElementToGroup(block, 1);
+    }
+    // GroupId >= 0 filters out landmarks the graph knows about but that are
+    // not in the problem; a stale entry would trip Ceres' size check.
+    for (const auto& lm : realtimeGraph_.landmarks_) {
+      double* block = lm.second.hPoint->parameters();
+      if (ordering->GroupId(block) >= 0) {
+        ordering->AddElementToGroup(block, 0);
+      }
+    }
+    realtimeGraph_.options_.linear_solver_ordering = ordering;
+  } else {
+    realtimeGraph_.options_.linear_solver_ordering = nullptr;
+  }
   {
     // The two call sites are timed apart: "3 Optimise" enters with
     // onlyNewestState=false, matchToMap's realtimeOptimise with true.
@@ -1028,6 +1209,7 @@ void ViSlamBackend::optimiseRealtimeGraph(
   tSyncLandmarks.stop();
 
   // finally adopt stuff from realtime optimisation results in full and observation-less graphs
+  TimerSwitchable tSyncImu("3.7 sync IMU error terms -> fullGraph (main path)");
   for(auto riter = realtimeGraph_.states_.rbegin(); riter != realtimeGraph_.states_.rend();
       ++riter) {
     if(!riter->second.previousImuLink.errorTerm) {
@@ -1050,6 +1232,7 @@ void ViSlamBackend::optimiseRealtimeGraph(
       break;
     }
   }
+  tSyncImu.stop();
 
   // unfreeze if necessary
   if(initialFixation && initialFixationId) {
@@ -1411,6 +1594,81 @@ void ViSlamBackend::drawOverheadImage(cv::Mat &image, int idx) const
 }
 
 bool ViSlamBackend::getObservedIds(StateId id, std::set<StateId> &observedIds) const
+{
+  const int mode = obsIdsFlatMode();
+  if (mode == 0) {
+    return getObservedIdsStock(id, observedIds);
+  }
+  if (mode == 1) {
+    return getObservedIdsFlat(id, observedIds);
+  }
+  std::set<StateId> reference = observedIds;
+  const bool ok = getObservedIdsStock(id, reference);
+  std::set<StateId> flat = observedIds;
+  const bool okFlat = getObservedIdsFlat(id, flat);
+  noteCompared(3, ok == okFlat && reference == flat);
+  OKVIS_ASSERT_TRUE(Exception, ok == okFlat && reference == flat,
+                    "getObservedIds: flat path disagrees for state " << id.value())
+  observedIds = reference;
+  return ok;
+}
+
+// The stock version reaches a set of at most a couple of dozen frame IDs through
+// a std::set of every landmark ID of the state -- roughly 900 node allocations
+// per call, VIO_PROFILING.md 3.18.4. Sorted vectors give the same set: the
+// landmark pass only needs to be deduplicated, and insertion order into a
+// std::set is irrelevant.
+bool ViSlamBackend::getObservedIdsFlat(StateId id, std::set<StateId> &observedIds) const
+{
+  auto iter = realtimeGraph_.states_.find(id);
+  if (iter == realtimeGraph_.states_.end()) {
+    return false;
+  }
+  const auto &state = iter->second;
+
+  std::vector<uint64_t>& frameIds = obsIdsFrameScratch_;
+  frameIds.clear();
+  for (const auto &link : state.twoPoseLinks) {
+    frameIds.push_back(link.second.state0.value());
+    frameIds.push_back(link.second.state1.value());
+  }
+
+  if (keyFrames_.count(id) || imuFrames_.count(id) || loopClosureFrames_.count(id)) {
+    std::vector<uint64_t>& landmarks = obsIdsLandmarkScratch_;
+    landmarks.clear();
+    landmarks.reserve(state.observations.size());
+    for (const auto &obs : state.observations) {
+      landmarks.push_back(obs.second.landmarkId.value());
+    }
+    std::sort(landmarks.begin(), landmarks.end());
+    landmarks.erase(std::unique(landmarks.begin(), landmarks.end()), landmarks.end());
+    for (const uint64_t lmId : landmarks) {
+      for (const auto &obs : realtimeGraph_.landmarks_.at(LandmarkId(lmId)).observations) {
+        frameIds.push_back(obs.first.frameId);
+      }
+    }
+  }
+
+  auto next = iter;
+  next++;
+  if (next != realtimeGraph_.states_.end()) {
+    frameIds.push_back(next->first.value());
+  }
+  if (iter != realtimeGraph_.states_.begin()) {
+    auto previous = iter;
+    previous--;
+    frameIds.push_back(previous->first.value());
+  }
+
+  std::sort(frameIds.begin(), frameIds.end());
+  frameIds.erase(std::unique(frameIds.begin(), frameIds.end()), frameIds.end());
+  for (const uint64_t frameId : frameIds) {
+    observedIds.insert(StateId(frameId));
+  }
+  return true;
+}
+
+bool ViSlamBackend::getObservedIdsStock(StateId id, std::set<StateId> &observedIds) const
 {
   auto iter = realtimeGraph_.states_.find(id);
   if (iter == realtimeGraph_.states_.end()) {
@@ -1930,7 +2188,9 @@ int ViSlamBackend::cleanUnobservedLandmarks() {
   //                    "trying to clean unobserved landmarks while loop closing")
   //}
   std::map<LandmarkId, std::set<KeypointIdentifier>> removed;
+  TimerSwitchable tCleanRt("2.13a clean realtimeGraph");
   int removed1 = realtimeGraph_.cleanUnobservedLandmarks(&removed);
+  tCleanRt.stop();
   for(const auto & rem : removed) {
     for(const auto & obs : rem.second) {
       // note: it can happen (rarely) that a landmark gets cleaned but then re-added,
@@ -1949,7 +2209,9 @@ int ViSlamBackend::cleanUnobservedLandmarks() {
     }
     return removed1; /// \todo This can be done with some refactoring
   } else {
+    TimerSwitchable tCleanFull("2.13b clean fullGraph");
     int removed0 = fullGraph_.cleanUnobservedLandmarks();
+    tCleanFull.stop();
     OKVIS_ASSERT_TRUE(Exception, removed0 == removed1, "landmarks cleaned inconsistent!")
     return removed1;
   }
@@ -2835,6 +3097,94 @@ StateId ViSlamBackend::currentKeyframeStateId(bool considerLoopClosureFrames) co
 
 StateId ViSlamBackend::mostOverlappedStateId(StateId frame, bool considerLoopClosureFrames) const
 {
+  const int memoMode = overlapMemoMode();
+  if (memoMode == 0) {
+    return mostOverlappedStateIdStock(frame, considerLoopClosureFrames);
+  }
+
+  // Everything the answer depends on, cheap enough to rebuild on every call:
+  // the frames the stock loop below would actually compare against, and the
+  // keypoint and landmark ID versions of the query frame and of each of them.
+  //
+  // Applying the same two skips as the stock loop matters, it is not just
+  // tidiness: "7.2 eliminate IMU frames" drops a non-keyframe from imuFrames_
+  // between the "4.0b" and "7.1b" sweeps, and a candidate list that still
+  // carried it would look changed on every single frame.
+  std::vector<StateId>& candidates = memoCandidateScratch_;
+  std::vector<uint64_t>& versions = memoVersionScratch_;
+  candidates.clear();
+  versions.clear();
+  candidates.insert(candidates.end(), keyFrames_.begin(), keyFrames_.end());
+  candidates.insert(candidates.end(), imuFrames_.begin(), imuFrames_.end());
+  candidates.insert(candidates.end(), loopClosureFrames_.begin(), loopClosureFrames_.end());
+  std::sort(candidates.begin(), candidates.end());
+  candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+  candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                  [&](StateId id) {
+                                    if (id == frame) return true;
+                                    if (!considerLoopClosureFrames
+                                        && currentLoopClosureFrames_.count(id)) return true;
+                                    auto s = realtimeGraph_.states_.find(id);
+                                    return s == realtimeGraph_.states_.end()
+                                        || !s->second.isKeyframe;
+                                  }),
+                   candidates.end());
+  const auto appendVersions = [this, &versions](StateId id) {
+    auto iter = multiFrames_.find(id);
+    if (iter == multiFrames_.end()) {
+      versions.push_back(~uint64_t(0));
+      return;
+    }
+    for (size_t im = 0; im < iter->second->numFrames(); ++im) {
+      versions.push_back(iter->second->landmarkIdVersion(im));
+      versions.push_back(iter->second->keypointVersion(im));
+    }
+  };
+  appendVersions(frame);
+  for (StateId id : candidates) {
+    appendVersions(id);
+  }
+
+  const OverlapMemo* hit = nullptr;
+  for (const OverlapMemo& m : overlapMemo_) {
+    if (m.query == frame && m.candidates == candidates && m.versions == versions) {
+      hit = &m;
+      break;
+    }
+  }
+  tally().memoCalls.fetch_add(1, std::memory_order_relaxed);
+  if (hit) {
+    tally().memoHits.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (hit && memoMode == 1) {
+    return hit->result;
+  }
+
+  const StateId result = mostOverlappedStateIdStock(frame, considerLoopClosureFrames);
+  if (hit) {
+    noteCompared(2, hit->result == result);
+    OKVIS_ASSERT_TRUE(Exception, hit->result == result,
+                      "mostOverlappedStateId: memo " << hit->result.value()
+                      << " vs recomputed " << result.value())
+    return result;
+  }
+  constexpr size_t kSlots = 4;
+  if (overlapMemo_.size() < kSlots) {
+    overlapMemo_.emplace_back();
+    overlapMemoNext_ = overlapMemo_.size() - 1;
+  }
+  OverlapMemo& slot = overlapMemo_[overlapMemoNext_];
+  overlapMemoNext_ = (overlapMemoNext_ + 1) % kSlots;
+  slot.query = frame;
+  slot.candidates = candidates;
+  slot.versions = versions;
+  slot.result = result;
+  return result;
+}
+
+StateId ViSlamBackend::mostOverlappedStateIdStock(StateId frame,
+                                                 bool considerLoopClosureFrames) const
+{
   std::set<StateId> allFrames;
   allFrames.insert(keyFrames_.begin(), keyFrames_.end());
   allFrames.insert(imuFrames_.begin(), imuFrames_.end());
@@ -2932,6 +3282,9 @@ void ViSlamBackend::clear()
   fullGraph_.clear();
 
   multiFrames_.clear();
+  overlapCache_.clear();
+  overlapMemo_.clear();
+  overlapMemoNext_ = 0;
 
   auxiliaryStates_.clear(); // Store information about states.
   currentComponentIdx_ = 0; // The index of the current component.
@@ -2958,6 +3311,167 @@ void ViSlamBackend::clear()
 
 double ViSlamBackend::overlapFraction(const MultiFramePtr frameA,
                                       const MultiFramePtr frameB) const {
+  const int mode = overlapCacheMode();
+  if (mode == 1) {
+    return overlapFractionCached(frameA, frameB, false);
+  }
+  const double reference = overlapFractionStock(frameA, frameB);
+  if (mode == 2) {
+    const double cached = overlapFractionCached(frameA, frameB, true);
+    noteCompared(0, cached == reference);
+    OKVIS_ASSERT_TRUE(Exception, cached == reference,
+                      "overlapFraction: cached " << cached << " vs stock " << reference)
+  }
+  return reference;
+}
+
+// The cached path is an exact rewrite of overlapFractionStock() below, resting on
+// three identities rather than on any approximation:
+//  - the detection mask of a frame is a function of that frame's keypoints only,
+//    and keypoints never move after Frame::describe();
+//  - the landmark ID list of a frame changes only through Frame::setLandmarkId(),
+//    which bumps Frame::landmarkIdVersion();
+//  - every circle painted into the match mask is also painted into the detection
+//    mask (same centre, same radius, matched keypoints being a subset of all
+//    keypoints), so matches is a subset of detections pixel-wise and the IoU is
+//    countNonZero(matches) / countNonZero(detections) with no bitwise pass.
+double ViSlamBackend::overlapFractionCached(const MultiFramePtr frameA,
+                                            const MultiFramePtr frameB,
+                                            bool verify) const {
+  OKVIS_ASSERT_TRUE(Exception, frameA->numFrames() == frameB->numFrames(),
+                    "must be same number of frames")
+  const size_t numFrames = frameA->numFrames();
+  const MultiFramePtr frames[2] = {frameA, frameB};
+
+  // Drop entries for frames the estimator has forgotten. Bounded by the number
+  // of live frames, so this is a handful of comparisons per call at worst.
+  if (overlapCache_.size() > multiFrames_.size() + 2) {
+    for (auto it = overlapCache_.begin(); it != overlapCache_.end();) {
+      it = multiFrames_.count(StateId(it->first)) ? std::next(it) : overlapCache_.erase(it);
+    }
+  }
+
+  const OverlapFrameCache* entries[2];
+  for (size_t f = 0; f < 2; ++f) {
+    OverlapFrameCache& c = overlapCache_[frames[f]->id()];
+    if (c.detections.size() != numFrames) {
+      c.detections.resize(numFrames);
+      c.detectionArea.assign(numFrames, 0);
+      c.keypointVersion.assign(numFrames, ~uint64_t(0));
+      c.landmarkIds.resize(numFrames);
+      c.landmarkIdVersion.assign(numFrames, ~uint64_t(0));
+    }
+    for (size_t im = 0; im < numFrames; ++im) {
+      if (frames[f]->image(im).empty()) continue;
+      const int rows = frames[f]->image(im).rows/10;
+      const int cols = frames[f]->image(im).cols/10;
+      const double radius = double(std::min(rows,cols))*kptradius_;
+      const size_t num = frames[f]->numKeypoints(im);
+      cv::KeyPoint keypoint;
+      const uint64_t kpVersion = frames[f]->keypointVersion(im);
+      const bool maskStale = c.detections[im].empty() || c.keypointVersion[im] != kpVersion;
+      if (maskStale || verify) {
+        cv::Mat mask = cv::Mat::zeros(rows, cols, CV_8UC1);
+        for (size_t k = 0; k < num; ++k) {
+          frames[f]->getCvKeypoint(im, k, keypoint);
+          cv::circle(mask, keypoint.pt*0.1, int(radius), cv::Scalar(255), cv::FILLED);
+        }
+        if (maskStale) {
+          c.detections[im] = mask;
+          c.detectionArea[im] = cv::countNonZero(mask);
+          c.keypointVersion[im] = kpVersion;
+        } else {
+          // Mode 2: the version stamp says the cache is still good, so this
+          // repaint must be byte-for-byte what is already there. Checking it on
+          // every call over a whole replay is what turns "keypoints do not move"
+          // from an audit into a measurement.
+          const bool equal = c.detections[im].size() == mask.size()
+              && cv::countNonZero(c.detections[im] != mask) == 0;
+          noteCompared(1, equal);
+          OKVIS_ASSERT_TRUE(Exception, equal,
+                            "overlapFraction: cached detection mask changed for frame "
+                            << frames[f]->id() << " camera " << im)
+        }
+      }
+      const uint64_t version = frames[f]->landmarkIdVersion(im);
+      if (c.landmarkIdVersion[im] != version) {
+        std::vector<uint64_t>& ids = c.landmarkIds[im];
+        ids.clear();
+        ids.reserve(num);
+        for (size_t k = 0; k < num; ++k) {
+          const uint64_t lmId = frames[f]->landmarkId(im, k);
+          if (lmId != 0) {
+            ids.push_back(lmId);
+          }
+        }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        c.landmarkIdVersion[im] = version;
+      }
+    }
+    entries[f] = &c;
+  }
+
+  // find matches -- the stock code intersects one std::set per frame built from
+  // all cameras, so the per-camera lists are merged first.
+  for (size_t f = 0; f < 2; ++f) {
+    std::vector<uint64_t>& m = mergedScratch_[f];
+    m.clear();
+    for (size_t im = 0; im < numFrames; ++im) {
+      m.insert(m.end(), entries[f]->landmarkIds[im].begin(),
+               entries[f]->landmarkIds[im].end());
+    }
+    std::sort(m.begin(), m.end());
+    m.erase(std::unique(m.begin(), m.end()), m.end());
+  }
+  matchScratch_.clear();
+  std::set_intersection(mergedScratch_[0].begin(), mergedScratch_[0].end(),
+                        mergedScratch_[1].begin(), mergedScratch_[1].end(),
+                        std::back_inserter(matchScratch_));
+
+  // without matches there will be no overlap
+  if (matchScratch_.empty()) {
+    return 0.0;
+  }
+
+  if (matchMaskScratch_.size() < numFrames) {
+    matchMaskScratch_.resize(numFrames);
+  }
+  double overlap[2];
+  for (size_t f = 0; f < 2; ++f) {
+    int intersectionCount = 0;
+    int unionCount = 0;
+    for (size_t im = 0; im < numFrames; ++im) {
+      if (frames[f]->image(im).empty()) continue;
+      const int rows = frames[f]->image(im).rows/10;
+      const int cols = frames[f]->image(im).cols/10;
+      const double radius = double(std::min(rows,cols))*kptradius_;
+      cv::Mat& matchMask = matchMaskScratch_[im];
+      if (matchMask.rows != rows || matchMask.cols != cols || matchMask.type() != CV_8UC1) {
+        matchMask = cv::Mat::zeros(rows, cols, CV_8UC1);
+      } else {
+        matchMask.setTo(cv::Scalar(0));
+      }
+      const size_t num = frames[f]->numKeypoints(im);
+      cv::KeyPoint keypoint;
+      for (size_t k = 0; k < num; ++k) {
+        const uint64_t lmId = frames[f]->landmarkId(im, k);
+        if (lmId == 0) continue;
+        if (!std::binary_search(matchScratch_.begin(), matchScratch_.end(), lmId)) continue;
+        frames[f]->getCvKeypoint(im, k, keypoint);
+        cv::circle(matchMask, keypoint.pt*0.1, int(radius), cv::Scalar(255), cv::FILLED);
+      }
+      intersectionCount += cv::countNonZero(matchMask);
+      unionCount += entries[f]->detectionArea[im];
+    }
+    overlap[f] = double(intersectionCount)/double(unionCount);
+  }
+
+  return std::min(overlap[0], overlap[1]);
+}
+
+double ViSlamBackend::overlapFractionStock(const MultiFramePtr frameA,
+                                           const MultiFramePtr frameB) const {
 
   OKVIS_ASSERT_TRUE(Exception, frameA->numFrames() == frameB->numFrames(),
                     "must be same number of frames")
