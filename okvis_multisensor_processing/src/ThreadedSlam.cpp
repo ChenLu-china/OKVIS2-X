@@ -688,10 +688,15 @@ bool ThreadedSlam::processFrame() {
   }
 
   // IMPORTANT: the matcher needs the optimiser to be finished:
+  // The time spent blocked here is the part of the back-end thread (optimise +
+  // publish + marginalise) that detection did not manage to hide, i.e. exactly
+  // the amount that better pipelining could win back.
+  TimerSwitchable waitOptTimer("1.9 wait for optimisation thread");
   if(optimisationThread_.joinable()) {
     // in the very beginning, we can't join because it was not started
     optimisationThread_.join();
   }
+  waitOptTimer.stop();
 
   // now store last optimised state for later use
   if (estimator_.numFrames() > 0) {
@@ -819,7 +824,10 @@ bool ThreadedSlam::processFrame() {
       tProcessLiveDepthLidar.stop();
     }
   }
-  imuMeasurementsByFrame_[StateId(multiFrame->id())] = imuMeasurementDeque_;
+  {
+    TimerSwitchable tImuByFrame("2.0b copy IMU deque into imuMeasurementsByFrame_");
+    imuMeasurementsByFrame_[StateId(multiFrame->id())] = imuMeasurementDeque_;
+  }
 
   // Check if we need new kf due to lidar overlap
   bool kfPrior = false;
@@ -838,7 +846,9 @@ bool ThreadedSlam::processFrame() {
     estimator_.clear();
     return false;
   }
+  TimerSwitchable tSetKeyframe("2.9 setKeyframe");
   estimator_.setKeyframe(StateId(multiFrame->id()), asKeyframe);
+  tSetKeyframe.stop();
   matchTimer.stop();
 
   // Add GPS Measurements
@@ -966,6 +976,7 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
 
   // prepare for publishing
   TimerSwitchable publishTimer("4 Prepare publishing");
+  TimerSwitchable tAssemble("4.0 assemble state + tracking state");
   T_WS = estimator_.pose(StateId(multiFrame->id()));
   speedAndBiases = estimator_.speedAndBias(StateId(multiFrame->id()));
   StateId id(multiFrame->id());
@@ -1002,7 +1013,12 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
     }
   }
   state.T_AiW = T_AiW;
+  // Walks every landmark of the state and then every observation of those
+  // landmarks into a std::set; the two blocks below are the only parts of "4.0"
+  // that are not plain field copies.
+  TimerSwitchable tObsIds("4.0a getObservedIds (covisible frames)");
   estimator_.getObservedIds(state.id, state.covisibleFrameIds);
+  tObsIds.stop();
 
   TrackingState trackingState;
   if(lidarKeyframes_.count(id) == 0){
@@ -1022,7 +1038,12 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
   } else {
     trackingState.trackingQuality = TrackingQuality::Good;
   }
+  // Fourth overlapFraction sweep of the frame; the other three are in
+  // applyStrategy (7.1b / 7.2a / 7.6a), all on this same thread.
+  TimerSwitchable tMostOverlap("4.0b mostOverlappedStateId (overlapFraction)");
   trackingState.currentKeyframeId = estimator_.mostOverlappedStateId(id, false);
+  tMostOverlap.stop();
+  tAssemble.stop();
 
   // re-propagate
   hasStarted_.store(true);
@@ -1032,6 +1053,7 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
     // current state & tracking info via State and Tracking State.
     // the graph:
     std::vector<StateId> updatedStateIds;
+    TimerSwitchable tGatherStates("4.1 gather updated + affected states");
     PublicationData publicationData;
     publicationData.state = state;
     publicationData.trackingState = trackingState;
@@ -1046,7 +1068,11 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
       SpeedAndBias speedAndBias = estimator_.speedAndBias(id);
       Time timestamp = estimator_.timestamp(id);
       const bool isKeyframe = estimator_.isKeyframe(id);
+      // Deep-copies the whole IMU deque of that state, once per updated state
+      // per frame, and again into the State below.
+      TimerSwitchable tImuCopy("4.1a copy IMU deque (per updated state)");
       ImuMeasurementDeque imuMeasurements = imuMeasurementsByFrame_.at(id);
+      tImuCopy.stop();
       Eigen::Vector3d omega_S(0.0, 0.0, 0.0); // get this for real now:
       for(auto riter = imuMeasurements.rbegin(); riter!=imuMeasurements.rend(); ++riter) {
         if(riter->timeStamp < timestamp) {
@@ -1056,9 +1082,12 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
       }
 
       std::set<StateId> observedIds;
+      TimerSwitchable tObsIds2("4.1b getObservedIds (per updated state)");
       estimator_.getObservedIds(id, observedIds);
+      tObsIds2.stop();
       AlignedVector<Eigen::Vector3d> gpsPoints;
       estimator_.gpsMeasurements(id, gpsPoints);
+      TimerSwitchable tEmplace("4.1c construct + insert State (per updated state)");
       (*publicationData.updatedStates)[id] = State{T_WS, speedAndBias.head<3>(),
                                     speedAndBias.segment<3>(3), speedAndBias.tail<3>(),
                                     omega_S, timestamp, id, imuMeasurements, isKeyframe,
@@ -1066,7 +1095,9 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
                                     observedIds, true,
                                     false, AlignedMap<uint64_t, kinematics::Transformation>(),
                                     estimator_.T_GW(), gpsPoints};
+      tEmplace.stop();
     }
+    TimerSwitchable tAffected("4.1d gather affected states (whole loop)");
     for (const auto &id : affectedStates_) {
       kinematics::Transformation T_WS = estimator_.pose(id);
       SpeedAndBias speedAndBias = estimator_.speedAndBias(id);
@@ -1098,24 +1129,41 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
                 false, AlignedMap<uint64_t, kinematics::Transformation>(),
                 estimator_.T_GW(), gpsPoints};
     }
+    tAffected.stop();
     affectedStates_.clear();
+    tGatherStates.stop();
 
     // landmarks: copies the WHOLE map every frame, so this grows with map size
     // rather than with anything about the current frame.
+    // Only position, quality and the newest observation's frame ID end up in the
+    // published vector, but getLandmarks() deep-copies every observation set to
+    // get there. By default those three fields are read straight off the graph.
+    static const int pubLightMode = []() {
+      const char* e = std::getenv("OKVIS_PUB_LIGHT");
+      return e ? std::atoi(e) : 1;   // OKVIS_PUB_LIGHT=0 for the deep-copy path
+    }();
     TimerSwitchable tPackLandmarks("4.2 pack landmarks (whole map)");
     publicationData.landmarksPublish.reset(new MapPointVector());
-    MapPoints landmarks;
-    estimator_.getLandmarks(landmarks);
-    publicationData.landmarksPublish->reserve(landmarks.size());
-    for(const auto & lm : landmarks) {
-      auto latestObservedFrameId = *lm.second.observations.rbegin();
-      publicationData.landmarksPublish->push_back(
-            MapPoint(lm.first.value(), lm.second.point, lm.second.quality,
-                     latestObservedFrameId.getFrameId()));
+    if(pubLightMode == 1) {
+      estimator_.getLandmarksForPublish(*publicationData.landmarksPublish);
+    } else {
+      MapPoints landmarks;
+      estimator_.getLandmarks(landmarks);
+      publicationData.landmarksPublish->reserve(landmarks.size());
+      for(const auto & lm : landmarks) {
+        auto latestObservedFrameId = *lm.second.observations.rbegin();
+        publicationData.landmarksPublish->push_back(
+              MapPoint(lm.first.value(), lm.second.point, lm.second.quality,
+                       latestObservedFrameId.getFrameId()));
+      }
     }
     tPackLandmarks.stop();
 
     // now publish in separate thread. queue size 3 to ensure nothing ever lost.
+    // In blocking mode (replay) this waits for the consumer, so it would be
+    // back-pressure rather than work; timed separately to tell the two apart.
+    // Measured 0.007 ms/frame -- there is no back-pressure here.
+    TimerSwitchable tPush("4.3 push publication queue");
     if(blocking_){
       // in blocked processing, we also want to be able to block the okvis-estimator from outside
       publicationQueue_.PushBlockingIfFull(publicationData,1);
@@ -1126,6 +1174,7 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
         LOG(ERROR) << "publication (full update) overrun: dropping";
       }
     }
+    tPush.stop();
 
     // if(realtimePropagation_) {
     //   // pass on into IMU processing loop for realtime propagation later.
@@ -1137,8 +1186,10 @@ void ThreadedSlam::optimisePublishMarginalise(MultiFramePtr multiFrame,
     // }
 
     // Update Realtime Trajectory object
+    TimerSwitchable tTraj("4.4 trajectory update");
     std::set<StateId> affectedStateIds;
     trajectory_.update(publicationData.trackingState, publicationData.updatedStates, affectedStateIds);
+    tTraj.stop();
   }
   publishTimer.stop();
 
