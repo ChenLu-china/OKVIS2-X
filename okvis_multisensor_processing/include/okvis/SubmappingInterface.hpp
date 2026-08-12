@@ -582,6 +582,19 @@ namespace okvis {
                                            uint64_t activeId, uint64_t previousId);
 
         /**
+         * @brief Whether kfId names a submap whose map has actually been allocated.
+         *
+         * seSubmapLookup_ is not a set of submaps: processSupereightFrames() inserts
+         * {nullptr, T_WK} for every tracked keyframe and only fills in .map when that
+         * keyframe becomes a submap. Uses find() rather than operator[] on purpose --
+         * indexing would insert one more null-map entry for an absent id.
+         */
+        bool hasAllocatedSubmap(uint64_t kfId) const {
+          const auto it = seSubmapLookup_.find(kfId);
+          return it != seSubmapLookup_.end() && it->second.map != nullptr;
+        }
+
+        /**
          * @brief Find point_B that is observed in map_A
         */
         size_t determineObservedPoints(uint64_t& mapIdA, uint64_t& mapIdB,
@@ -738,6 +751,21 @@ namespace okvis {
                 supereightFrames_; ///< Queue with the s8 frames (i.e. poses and depth
 
         std::mutex finishMutex_; // mutex for checking if the integration of data has finished
+        // Serialises checkForAvailableData() (dataIntegration_ thread) against
+        // finishedIntegrating() (the *caller's* thread). Both build, hand over and
+        // destroy frame_, so without this they corrupt the heap: finishedIntegrating()
+        // may run frame_.reset() -- i.e. ~SupereightFrames() -- while frameUpdater()
+        // is writing frame_->frameData_. Its "am I idle?" test cannot be trusted for
+        // that, because checkForAvailableData() pops from stateUpdates_ *before* it
+        // does the work derived from it, so both queues read empty while the
+        // integration thread is still mid-frame.
+        std::mutex integrationMutex_;
+        // Same deal for the submapIntegration_ thread: held across one supereight
+        // frame's processing, so finishedIntegrating() cannot read submapAlignBlock_
+        // and seSubmapLookup_ while that frame is rewriting them. Replaces the
+        // check-then-act on isProcessingSeFrame_, which is set only after the frame
+        // has already left the queue.
+        std::mutex seFrameMutex_;
         std::mutex gtDebug_;
         std::mutex trajMutex_;
         AlignedUnorderedMap<uint64_t, Transformation> gtPoses_;

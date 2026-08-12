@@ -496,6 +496,14 @@ namespace okvis {
 
 
     bool SubmappingInterface::finishedIntegrating(){
+      // Callers poll this from their own thread while both worker threads are live,
+      // and the block below hands over and destroys frame_, rewrites
+      // submapAlignBlock_ and indexes seSubmapLookup_. Take both worker locks so
+      // neither dataIntegration_ nor submapIntegration_ can be inside its own
+      // critical section while we do. Lock order integrationMutex_ -> seFrameMutex_;
+      // no other code path takes both, so it cannot invert.
+      std::lock_guard<std::mutex> integrationLock(integrationMutex_);
+      std::lock_guard<std::mutex> seFrameLock(seFrameMutex_);
       uint64_t numMessages;
       numMessages = supereightFrames_.Size() + stateUpdates_.Size();
       if(numMessages == 0 && seSubmapLookup_.size() > 0 && !isProcessingSeFrame_){
@@ -728,6 +736,14 @@ namespace okvis {
             drawSubmaps();
           }
           TimerSwitchable timingProcessSeFrame("9 Process supereight frames");
+          // isProcessingSeFrame_ alone cannot keep finishedIntegrating() out of this
+          // body: it is set *after* PopBlocking() already dropped
+          // supereightFrames_.Size() to 0, so a caller polling
+          // "Size()==0 && !isProcessingSeFrame_" can pass the test and then run
+          // depthMap2MapFactors() straight through decideNewSubmap() inserting
+          // seSubmapLookup_[kfId] = {nullptr, ...} below -- and dereference that
+          // null map. Hold the lock finishedIntegrating() takes instead.
+          std::lock_guard<std::mutex> seFrameLock(seFrameMutex_);
           isProcessingSeFrame_ = true;
 
           TimerSwitchable timingNewSubmap("9.1 Decide a new submap");
@@ -1121,6 +1137,10 @@ namespace okvis {
     }
 
     bool SubmappingInterface::checkForAvailableData() {
+      // Held for the whole body: every frame_ access below (directly and via
+      // frameUpdater()) has to be excluded from finishedIntegrating(). Ordered
+      // before trajectoryLocked_, which is the only other lock taken in here.
+      std::lock_guard<std::mutex> integrationLock(integrationMutex_);
       std::map<size_t, std::vector<okvis::CameraMeasurement>> depthMeasurement;
       LidarMeasurement oldestLidarMeasurement;
       bool integrateLidar = true;
@@ -1621,8 +1641,11 @@ namespace okvis {
     std::vector<uint64_t> covisibleIds;
     obtainCovisibles(covisibleIds, StateId(activeId), 15);
     for(auto& it : seSubmapLookup_){
-      // Skip active, previous submap and non-covisible submaps (for depth); only active and previous for lidar
-      bool skip_submap = lidarSensors_ ? (it.first >= previousId) : (it.first >= previousId || std::find(covisibleIds.begin(), covisibleIds.end(), it.first) == covisibleIds.end());
+      // Skip active, previous submap and non-covisible submaps (for depth); only active and previous for lidar.
+      // Also skip keyframes that carry no submap: seSubmapLookup_ holds {nullptr, T_WK}
+      // for those, and get_bbox() below would dereference that null.
+      bool skip_submap = !it.second.map ||
+                         (lidarSensors_ ? (it.first >= previousId) : (it.first >= previousId || std::find(covisibleIds.begin(), covisibleIds.end(), it.first) == covisibleIds.end()));
       if(skip_submap){
         continue;
       }
@@ -1848,10 +1871,33 @@ namespace okvis {
 
   void SubmappingInterface::depthMap2MapFactors() {
     if(submapAlignBlock_.pointCloud_B.size() > 0){
+      // Everything below dereferences seSubmapLookup_[...].map, and there are three
+      // ways for that to be null here: seSubmapLookup_ also holds {nullptr, T_WK}
+      // entries for keyframes that never became submaps, frame_A_id stays
+      // UNINITIALIZED_ID until a second submap exists, and operator[] would quietly
+      // insert a fresh null-map entry for an id that is absent. The live caller
+      // (addSubmapAlignmentFactors) is fenced off from all three by its
+      // submapCounter_ > 2 test; finishedIntegrating() calls us on the shutdown path
+      // with no such precondition, which is what segfaults when a session ends with
+      // fewer than three submaps. Check the real precondition instead: without an
+      // allocated submap on both ends there is no map-to-map constraint to add, so
+      // skipping loses nothing.
+      if(!hasAllocatedSubmap(submapAlignBlock_.frame_B_id)) {
+        LOG(WARNING) << "no submap allocated for active keyframe "
+                     << submapAlignBlock_.frame_B_id
+                     << "; skipping depth map-to-map factors";
+        return;
+      }
       // Determine most overlapping point cloud
       uint64_t most_overlapping_id = findMostOverlappingSubmap(submapAlignBlock_.pointCloud_B, submapAlignBlock_.frame_B_id, submapAlignBlock_.frame_A_id);
       if(most_overlapping_id == std::numeric_limits<uint64_t>::max()) {
         most_overlapping_id = submapAlignBlock_.frame_A_id;
+      }
+      if(!hasAllocatedSubmap(most_overlapping_id)) {
+        LOG(WARNING) << "no submap allocated for reference keyframe "
+                     << most_overlapping_id
+                     << "; skipping depth map-to-map factors";
+        return;
       }
 
       // Determine observed points
