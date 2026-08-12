@@ -275,6 +275,20 @@ namespace okvis {
          * @brief      Destroys the object.
          */
         ~SubmappingInterface() {
+          // Both worker loops are `while(!isFinished())`, so they only ever leave
+          // once that flag is set -- joining them without setting it blocks
+          // forever. The flag is otherwise only set by an explicit setFinished()
+          // from the owner, which every path that returns early (a camera that
+          // fails to open, a throw out of setup) never reaches, so it has to be
+          // set here too. Not via setFinished(): that also does
+          // seSubmapLookup_[prevKeyframeId_].map->mesh(), which is a null
+          // dereference when we are dying before any submap was allocated.
+          // Idempotent on the normal shutdown path, where it is already true.
+          {
+            std::lock_guard<std::mutex> l(finishMutex_);
+            isFinished_ = true;
+          }
+
           // Shutdown all the Queues.
           depthMeasurements_.Shutdown();
           lidarMeasurements_.Shutdown();
