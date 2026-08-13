@@ -29,6 +29,7 @@
 #include <okvis/PseudoInverse.hpp>
 #include <okvis/Component.hpp>
 #include <okvis/timing/Timer.hpp>
+#include <okvis/VioHealth.hpp>
 
 /// \brief okvis Main namespace of this package.
 namespace okvis {
@@ -59,18 +60,21 @@ void accumulateCeresStats(const ::ceres::Solver::Summary &s, bool matchToMapPath
   a.iters += double(s.iterations.size());
   if (++a.n % 200 == 0) {
     const double n = double(a.n);
-    LOG(INFO) << "[ceres " << (matchToMapPath ? "matchToMap" : "main   ")
-              << "] calls=" << a.n
-              << " iters/call=" << a.iters / n
-              << " | total " << 1e3 * a.tot / n << " ms"
-              << " = pre " << 1e3 * a.pre / n
-              << " + minimizer " << 1e3 * a.min / n
-              << " + post " << 1e3 * a.post / n
-              << " || minimizer = residual " << 1e3 * a.res / n
-              << " + jacobian " << 1e3 * a.jac / n
-              << " + linear " << 1e3 * a.lin / n
-              << " | last: residual blocks " << s.num_residual_blocks
-              << ", effective params " << s.num_effective_parameters;
+    // Profiling instrumentation: it answers "where does the solve time go",
+    // which is a question you ask at a desk with GLOG_v=1, not one an
+    // unattended field run needs answered every few seconds.
+    VLOG(1) << "[ceres " << (matchToMapPath ? "matchToMap" : "main   ")
+            << "] calls=" << a.n
+            << " iters/call=" << a.iters / n
+            << " | total " << 1e3 * a.tot / n << " ms"
+            << " = pre " << 1e3 * a.pre / n
+            << " + minimizer " << 1e3 * a.min / n
+            << " + post " << 1e3 * a.post / n
+            << " || minimizer = residual " << 1e3 * a.res / n
+            << " + jacobian " << 1e3 * a.jac / n
+            << " + linear " << 1e3 * a.lin / n
+            << " | last: residual blocks " << s.num_residual_blocks
+            << ", effective params " << s.num_effective_parameters;
   }
 }
 
@@ -711,13 +715,39 @@ bool ViSlamBackend::applyStrategy(size_t numKeyframes,
   if(imuFrames_.size()>1 && !keyFrames_.empty()) {
     auto iter = auxiliaryStates_.rbegin();
     const double quality = trackingQuality(iter->first);
+    // Same reasoning as the frontend's tracking state (see Frontend.cpp): this
+    // is a condition that persists over many frames, so only the edges are
+    // worth a line each. The counters give the duration in the 5 s status line,
+    // and "recovered" stays at WARNING so `journalctl -p warning` shows the end
+    // of an episode and not just its start.
+    // applyStrategy only runs on the optimisation thread, so the state needs no
+    // synchronisation; the counters, read from the application thread, do.
+    enum class BackendTrack { kOk, kWeak, kFailure };
+    static BackendTrack backendTrackState = BackendTrack::kOk;
+    BackendTrack newBackendTrackState = BackendTrack::kOk;
     if (quality < 0.01) {
-      if (quality > 0.00001) {
-        LOG(WARNING) << "Tracking quality weak: quality=" << quality;
-      } else {
-        LOG(WARNING) << "TRACKING FAILURE: quality=" << quality;
-      }
+      newBackendTrackState =
+          quality > 0.00001 ? BackendTrack::kWeak : BackendTrack::kFailure;
       /// \todo: lost component handling currently disabled. Re-introduce!
+    }
+    if (newBackendTrackState == BackendTrack::kWeak) {
+      okvis::bump(okvis::vioHealth().backendWeak);
+    } else if (newBackendTrackState == BackendTrack::kFailure) {
+      okvis::bump(okvis::vioHealth().backendFailure);
+    }
+    if (newBackendTrackState != backendTrackState) {
+      switch (newBackendTrackState) {
+        case BackendTrack::kWeak:
+          LOG(WARNING) << "Tracking quality weak: quality=" << quality;
+          break;
+        case BackendTrack::kFailure:
+          LOG(WARNING) << "TRACKING FAILURE: quality=" << quality;
+          break;
+        case BackendTrack::kOk:
+          LOG(WARNING) << "Tracking quality recovered: quality=" << quality;
+          break;
+      }
+      backendTrackState = newBackendTrackState;
     }
   }
   t1.stop();

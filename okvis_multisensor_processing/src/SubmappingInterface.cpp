@@ -1030,7 +1030,12 @@ namespace okvis {
           if(create_new_submap && previousSubmapId_ != UNINITIALIZED_ID){
 
             LOG(INFO) << "Completed integrating submap " << previousSubmapId_ << " which is submap number " << seSubmapLookup_.size();
-            LOG(INFO) << okvis::timing::Timing::print();
+            // ~105 lines of cumulative-since-start timers, reprinted on every
+            // submap: at one submap per ~30 s it was a sixth of the whole
+            // journal, and every copy is a prefix of the table the application
+            // prints once at exit. Keep it for GLOG_v=1, where watching the
+            // timers evolve during a run is actually the point.
+            VLOG(1) << okvis::timing::Timing::print();
 
             DLOG(INFO) << "Trying to mesh for frame " << previousSubmapId_;
             if(previousSubmapId_ != UNINITIALIZED_ID){

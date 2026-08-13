@@ -57,6 +57,7 @@
 #pragma GCC diagnostic pop
 
 #include <okvis/Frontend.hpp>
+#include <okvis/VioHealth.hpp>
 
 namespace {
 // getLandmark() deep-copies the landmark's observation set. Two hot call sites
@@ -759,17 +760,45 @@ bool Frontend::dataAssociationAndInitialization(
     TimerSwitchable tTrackQual1("2.06 trackingQuality (after matchToMap)");
     trackingQuality = estimator.trackingQuality(StateId(framesInOut->id()));
     tTrackQual1.stop();
-    if (trackingQuality < 0.01) {
-      if(estimator.numFrames() == 2 && params.nCameraSystem.numCameras()==1) {
-        // mono. we can't have matches at this point, so don't warn
-      } else {
-        if (num3dMatches >= 3) {
+    // Tracking quality is a state, not a per-frame event. A debrief needs to
+    // know when it degraded, when it came back and how long it lasted -- so log
+    // the transitions verbatim, with the numbers that explain them, and let the
+    // 5 s counters carry the duration. A minutes-long dropout then costs two
+    // lines instead of thousands, without becoming invisible.
+    // Recovery is logged at WARNING deliberately: at INFO it would vanish from
+    // `journalctl -p warning`, leaving a reader who filters that way with an
+    // onset and no end, i.e. worse than no line at all.
+    // dataAssociationAndInitialization only ever runs on the main processing
+    // thread, so the state itself needs no synchronisation; only the counters,
+    // which the application thread reads, are atomic.
+    enum class TrackState { kOk, kWeak, kLost };
+    static TrackState trackState = TrackState::kOk;
+    TrackState newTrackState = TrackState::kOk;
+    if (trackingQuality < 0.01
+        && !(estimator.numFrames() == 2 && params.nCameraSystem.numCameras() == 1)) {
+      // (mono at the second frame cannot have matches yet -- not a warning)
+      newTrackState = num3dMatches >= 3 ? TrackState::kWeak : TrackState::kLost;
+    }
+    if (newTrackState == TrackState::kWeak) {
+      okvis::bump(okvis::vioHealth().trackingWeak);
+    } else if (newTrackState == TrackState::kLost) {
+      okvis::bump(okvis::vioHealth().trackingLost);
+    }
+    if (newTrackState != trackState) {
+      switch (newTrackState) {
+        case TrackState::kWeak:
           LOG(WARNING) << "3d2d tracking weak: quality=" << trackingQuality
                        << ". Number of 3d2d-matches: " << num3dMatches;
-        } else {
+          break;
+        case TrackState::kLost:
           LOG(WARNING) << "3d2d tracking lost. Number of 3d2d-matches: " << num3dMatches;
-        }
+          break;
+        case TrackState::kOk:
+          LOG(WARNING) << "3d2d tracking recovered: quality=" << trackingQuality
+                       << ". Number of 3d2d-matches: " << num3dMatches;
+          break;
       }
+      trackState = newTrackState;
     }
 
     // do motion stereo
@@ -2083,7 +2112,14 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   const double strictReprThreshold = 3.0 + f*0.006;
   if (reprErr > strictReprThreshold) {
     if (params.imu.use) {
-      LOG(INFO) << "large reprojection error (" << reprErr << "): run RANSAC";
+      // Fires on a large fraction of frames whenever the scene is close or the
+      // estimator is unhappy, which is the situation you are most likely to be
+      // reading the journal about -- so it is exactly the line that buries
+      // everything else. The rate is what carries the information, and that is
+      // published every 5 s from the counter; keep the per-frame value for
+      // GLOG_v=2.
+      okvis::bump(okvis::vioHealth().ransacTriggered);
+      VLOG(2) << "large reprojection error (" << reprErr << "): run RANSAC";
       runRansac = true;
     }
     numInitIter += 2;
@@ -2112,13 +2148,15 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     decInitIter += size_t(numInitIter);
     decReprErrSum += reprErr;
     if (decCalls % 500 == 0) {
-      LOG(INFO) << "[mtm-decision] calls=" << decCalls
-                << " runRansac=" << decRansac << " ("
-                << 100.0 * double(decRansac) / double(decCalls) << "%)"
-                << " largeReprErr=" << decLargeReprErr
-                << " meanNumInitIter=" << double(decInitIter) / double(decCalls)
-                << " meanReprErr=" << decReprErrSum / double(decCalls)
-                << " threshold=" << strictReprThreshold;
+      // Profiling instrumentation, not an operational signal: the trigger rate
+      // an operator needs is in the 5 s status line now.
+      VLOG(1) << "[mtm-decision] calls=" << decCalls
+              << " runRansac=" << decRansac << " ("
+              << 100.0 * double(decRansac) / double(decCalls) << "%)"
+              << " largeReprErr=" << decLargeReprErr
+              << " meanNumInitIter=" << double(decInitIter) / double(decCalls)
+              << " meanReprErr=" << decReprErrSum / double(decCalls)
+              << " threshold=" << strictReprThreshold;
     }
   }
 #ifdef OKVIS_GPU_MATCHER
@@ -2351,7 +2389,13 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
   // final two steps optimisation
   if (secondRansac) {
     TimerSwitchable tRansac2("2.01g RANSAC #2 + optimise (uninitialised)");
-    LOG(INFO) << "Running RANSAC also with uninitialised landmarks";
+    // Two different causes reach here: a first RANSAC that failed, and a
+    // match-to-map that found <=3 landmarks (see where secondRansac is set
+    // again further up). So this counts "the frontend is retrying to recover",
+    // and in practice it tracks the tracking-lost count rather than the
+    // RANSAC-failure count.
+    okvis::bump(okvis::vioHealth().ransacUninit);
+    VLOG(1) << "Running RANSAC also with uninitialised landmarks";
     const bool ransacSuccess = runRansac3d2d(estimator, multiFrame->cameraSystem(), multiFrame,
                                              secondRansac, ransacRemoveOutliers);
     T_WS1 = estimator.pose(StateId(currentFrameId));
@@ -3360,8 +3404,9 @@ bool Frontend::runRansac3d2d(
     }
     return true;
   } else {
-    LOG(INFO) << "RANSAC FAIL: " << numInliers << " inliers, ratio = "
-              << double(ransac.inliers_.size())/double(numCorrespondences);
+    okvis::bump(okvis::vioHealth().ransacFailed);
+    VLOG(1) << "RANSAC FAIL: " << numInliers << " inliers, ratio = "
+            << double(ransac.inliers_.size())/double(numCorrespondences);
   }
   return false;
 }
