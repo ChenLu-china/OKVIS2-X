@@ -71,7 +71,7 @@ target_compile_options(${LIB_NAME}
 # host access). CUDA is enabled at the OKVIS top level when USE_NN+USE_GPU; only
 # wire the kernel in when a CUDA compiler is actually available, so pure-CPU
 # build variants keep compiling and just run the original threaded matcher.
-if(CMAKE_CUDA_COMPILER)
+if(USE_NN AND USE_GPU AND CMAKE_CUDA_COMPILER)
   find_package(CUDAToolkit REQUIRED)
   target_sources(${LIB_NAME} PRIVATE src/gpu_brisk_matcher.cu)
   target_compile_definitions(${LIB_NAME} PRIVATE OKVIS_GPU_MATCHER)
@@ -85,7 +85,7 @@ if(CMAKE_CUDA_COMPILER)
   set_target_properties(${LIB_NAME} PROPERTIES CUDA_STANDARD 17)
   message(STATUS "okvis_frontend: GPU BRISK matcher ENABLED (Thor sm_110)")
 else()
-  message(STATUS "okvis_frontend: no CUDA compiler, GPU matcher disabled (CPU path)")
+  message(STATUS "okvis_frontend: GPU matcher disabled (CPU path)")
 endif()
 if(USE_NN)
   target_compile_definitions(${LIB_NAME} PUBLIC OKVIS_USE_NN C10_USE_GLOG)
