@@ -20,6 +20,10 @@ option (USE_NN
         "Use keypoint classification as part of okvis, requires torch" ON)
 option (USE_GPU
         "Use keypoint classification with GPU inference, requires torch with Cuda" OFF)
+option (USE_GPU_MATCHER
+        "Build the CUDA BRISK match-to-map implementation independently of Torch" OFF)
+set(OKVIS_GPU_MATCHER_ARCHITECTURES "120" CACHE STRING
+    "CUDA architectures compiled for the GPU BRISK matcher")
 option (DO_TIMING
         "Enable timing" ON)
 option (BUILD_SHARED_LIBS
@@ -90,14 +94,20 @@ if (NOT "${CMAKE_BUILD_TYPE}" STREQUAL "Release")
   message(WARNING "CMAKE_BUILD_TYPE not set to 'Release'. Performance may be terrible.")
 endif()
 
-if(USE_NN AND USE_GPU)
+if(USE_GPU_MATCHER OR (USE_NN AND USE_GPU))
   if(APPLE)
-    # MPS enabled by default
+    if(USE_GPU_MATCHER)
+      message(FATAL_ERROR "USE_GPU_MATCHER requires CUDA and is not supported on Apple")
+    endif()
+    # MPS enabled by default for neural-network inference.
     add_compile_definitions(OKVIS_USE_MPS)
   else()
-    # If CUDA isn't enabled explicitly here it's not detected correctly by Torch.
+    # CUDA must be enabled before the frontend target adds its matcher kernel.
+    # Neural-network inference and the BRISK matcher remain separate features.
     enable_language(CUDA)
-    add_compile_definitions(OKVIS_USE_CUDA)
+    if(USE_NN AND USE_GPU)
+      add_compile_definitions(OKVIS_USE_CUDA)
+    endif()
   endif()
 endif()
 

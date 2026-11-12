@@ -68,22 +68,20 @@ target_compile_options(${LIB_NAME}
 )
 
 # GPU BRISK match-to-map (Jetson Thor integrated GPU, zero-copy via pageable
-# host access). CUDA is enabled at the OKVIS top level when USE_NN+USE_GPU; only
-# wire the kernel in when a CUDA compiler is actually available, so pure-CPU
-# build variants keep compiling and just run the original threaded matcher.
-if(USE_NN AND USE_GPU AND CMAKE_CUDA_COMPILER)
+# host access). Keep this independent of USE_NN/USE_GPU: the matcher does not
+# use Torch and should be available in a VIO-only build without NN models.
+if(USE_GPU_MATCHER AND CMAKE_CUDA_COMPILER)
   find_package(CUDAToolkit REQUIRED)
   target_sources(${LIB_NAME} PRIVATE src/gpu_brisk_matcher.cu)
   target_compile_definitions(${LIB_NAME} PRIVATE OKVIS_GPU_MATCHER)
   target_link_libraries(${LIB_NAME} PRIVATE CUDA::cudart)
-  # Pin the arch on the target: a re-configure can leave the global
-  # CMAKE_CUDA_ARCHITECTURES as OFF, which would emit no device code. Thor is
-  # Blackwell / compute capability 11.0 -> sm_110.
-  if(NOT CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "OFF")
-    set_target_properties(${LIB_NAME} PROPERTIES CUDA_ARCHITECTURES 110)
-  endif()
-  set_target_properties(${LIB_NAME} PROPERTIES CUDA_STANDARD 17)
-  message(STATUS "okvis_frontend: GPU BRISK matcher ENABLED (Thor sm_110)")
+  set_target_properties(${LIB_NAME} PROPERTIES
+    CUDA_ARCHITECTURES "${OKVIS_GPU_MATCHER_ARCHITECTURES}"
+    CUDA_STANDARD 17
+  )
+  message(STATUS
+    "okvis_frontend: GPU BRISK matcher ENABLED "
+    "(sm_${OKVIS_GPU_MATCHER_ARCHITECTURES})")
 else()
   message(STATUS "okvis_frontend: GPU matcher disabled (CPU path)")
 endif()
