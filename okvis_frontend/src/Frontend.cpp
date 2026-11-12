@@ -18,6 +18,7 @@
  */
 
 #include "okvis/assert_macros.hpp"
+#include <atomic>
 #include <opencv2/imgcodecs.hpp>
 #include <pthread.h>
 #include <sched.h>
@@ -1497,6 +1498,14 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     const char* e = std::getenv("OKVIS_MATCH_GPU");
     return e ? std::atoi(e) : 0;
   }();
+  static const bool gpuRuntimeAvailable = gpu::gpuMatcherAvailable();
+  static std::atomic_flag gpuUnavailableReported = ATOMIC_FLAG_INIT;
+  if (gpuMode != 0 && !gpuRuntimeAvailable
+      && !gpuUnavailableReported.test_and_set()) {
+    LOG(WARNING) << "OKVIS_MATCH_GPU=" << gpuMode
+                 << " requested, but this device cannot directly access pageable host memory; "
+                    "falling back to the CPU matcher.";
+  }
   // Shadow of reprErr built from the GPU's own numbers, so that mode 2 can
   // compare the *decision* (numInitIter, runRansac) and not just the matches.
   double reprErrGpu = 0.0;
@@ -1825,7 +1834,7 @@ int Frontend::matchToMap(Estimator &estimator, const okvis::ViParameters& params
     // does not build; the two switches are not meant to be combined, and Phase 0
     // already judged the GPU matcher a net loss (VIO_PROFILING.md 3.13).
     if (gpuMode != 0 && soaMode == 0 && !loopClosureLandmarksToUseExclusively
-        && gpu::gpuMatcherAvailable()) {
+        && gpuRuntimeAvailable) {
       // Reused across calls (capacity only grows): what this experiment has to
       // price is the irreducible cost of marshalling the frontend's pointer-
       // chasing containers into flat arrays, not the allocator on top of it.
